@@ -1,0 +1,9 @@
+{
+  "hook": "evolve.py",
+  "heartbeat_ms": 1800000,
+  "hook_timeout": 30000,
+  "heartbeat_title": "heartbeat",
+  "heartbeat_agent": "evolve",
+  "avatar": "📝",
+  "test_script": "tests/hello_test.py"
+}

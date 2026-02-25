@@ -1,0 +1,14 @@
+{
+  "name": "opencode-evolve",
+  "version": "0.1.0",
+  "description": "self-modifying hook plugin for opencode — agents evolve their own behavior at runtime",
+  "main": "src/index.ts",
+  "type": "module",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.2.14"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
+  }
+}
