@@ -24,7 +24,7 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
 ├── hooks/
 │   └── evolve.py           # hook script
 ├── prompts/                # prompt templates
-└── traits/                 # persona traits or any hook-specific content
+└── tests/                  # hook validation tests
 ```
 
 ## configuration
@@ -112,7 +112,7 @@ input:
 
 output:
 ```json
-{"modified": ["file.md"], "notify": [{"type": "trait_changed", "files": ["file.md"]}], "actions": [...]}
+{"modified": ["file.md"], "notify": [{"type": "some_change", "files": ["file.md"]}], "actions": [...]}
 ```
 
 #### `idle`
@@ -172,7 +172,7 @@ input:
 
 output:
 ```json
-{"message": "[trait-update] updated: FOO.md. re-read if needed."}
+{"message": "[update] modified: FOO.md. re-read if needed."}
 ```
 
 #### `recover`
@@ -227,7 +227,7 @@ the plugin provides builtin tools that let agents modify their own behavior at r
 
 ## tool discovery
 
-tools are defined by the hook's `discover` response. each tool gets a prefixed name derived from the hook filename stem. for example, if `hook` is `evolve.py`, a tool named `trait_read` becomes `evolve_trait_read`.
+tools are defined by the hook's `discover` response. each tool gets a prefixed name derived from the `hook` config path's filename stem. for example, with the default `hooks/evolve.py`, a tool named `my_tool` becomes `evolve_my_tool`.
 
 ### builtin tools
 

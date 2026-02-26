@@ -1,6 +1,6 @@
 # OpenCode API/SDK Reference
 
-reference for the opencode plugin and SDK APIs used by the persona plugin.
+reference for the opencode plugin and SDK APIs used by the plugin.
 source: `~/src/github.com/anomalyco/opencode/`
 
 ## SDK client

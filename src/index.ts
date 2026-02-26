@@ -49,7 +49,6 @@ const HOOK_PATH = path.join(WORKSPACE, CONFIG.hook)
 const RUNTIME_PATH = path.join(WORKSPACE, 'config', 'runtime.json')
 const TOOL_PREFIX = path.parse(CONFIG.hook).name
 const LOG_PREFIX = '[evolve]'
-const AGENT_MARKER = '<~ PERSONA AGENT MARKER ~>'
 // observational hooks — failure should not trigger recover cascade
 const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification'])
 
@@ -122,12 +121,8 @@ async function validateHook(hookContent: string): Promise<{ ok: boolean, output:
   const testScript = path.join(WORKSPACE, CONFIG.test_script)
   const tmp = mkdtempSync(path.join(tmpdir(), 'evolve-validate-'))
   try {
+    cpSync(WORKSPACE, tmp, { recursive: true })
     const hookPath = path.join(tmp, CONFIG.hook)
-    mkdirSync(path.dirname(hookPath), { recursive: true })
-    if (existsSync(path.join(WORKSPACE, 'traits')))
-      cpSync(path.join(WORKSPACE, 'traits'), path.join(tmp, 'traits'), { recursive: true })
-    if (existsSync(path.join(WORKSPACE, 'prompts')))
-      cpSync(path.join(WORKSPACE, 'prompts'), path.join(tmp, 'prompts'), { recursive: true })
     writeFileSync(hookPath, hookContent)
     chmodSync(hookPath, 0o755)
     const { ok, output } = await new Promise<{ ok: boolean, output: string }>((resolve) => {
@@ -373,7 +368,6 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       try {
         writeFileSync(path.join(WORKSPACE, 'prompts', prompt), content)
         trackModified([`prompts/${prompt}`])
-        queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }], context.sessionID)
         await commitWorkspace(`write prompt ${prompt}`)
         debug(`prompt_write ok: ${prompt}`)
         return `successfully wrote ${prompt}`
@@ -399,7 +393,6 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
         if (typeof result !== 'string') { debug(`prompt_patch failed: ${result.error}`); return `failed: ${result.error}` }
         writeFileSync(path.join(WORKSPACE, 'prompts', prompt), result)
         trackModified([`prompts/${prompt}`])
-        queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }], context.sessionID)
         await commitWorkspace(`patch prompt ${prompt}`)
         debug(`prompt_patch ok: ${prompt}`)
         return `successfully patched ${prompt}`
@@ -628,7 +621,6 @@ export const EvolvePlugin: Plugin = async ({ client, directory }) => {
 
     "experimental.chat.system.transform": async (input, output) => {
       try {
-        if (!output.system.some((s: string) => s.includes(AGENT_MARKER))) return
         // consume pending messages from messages.transform (FIFO correlation)
         const msgs = pendingMessagesQueue.shift()
         if (msgs && input.sessionID) sessionHistory.set(input.sessionID, msgs)
@@ -639,6 +631,7 @@ export const EvolvePlugin: Plugin = async ({ client, directory }) => {
         } else {
           const result = await callHook('mutate_request', {
             session: { id: input.sessionID },
+            system: output.system,
           }, input.sessionID)
           if (result.system?.length) {
             output.system.splice(0, output.system.length, ...result.system)
