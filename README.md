@@ -33,7 +33,7 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
 
 ```jsonc
 {
-  "hook": "evolve.py",            // hook script filename in hooks/
+  "hook": "hooks/evolve.py",      // hook script path (workspace-relative)
   "heartbeat_ms": 1800000,        // heartbeat interval (30 min)
   "hook_timeout": 30000,          // subprocess timeout (30s)
   "heartbeat_title": "heartbeat", // heartbeat session title

@@ -1,5 +1,5 @@
 {
-  "hook": "evolve.py",
+  "hook": "hooks/evolve.py",
   "heartbeat_ms": 1800000,
   "hook_timeout": 30000,
   "heartbeat_title": "heartbeat",

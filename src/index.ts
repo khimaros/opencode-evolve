@@ -21,7 +21,7 @@ interface EvolveConfig {
 }
 
 const DEFAULTS: EvolveConfig = {
-  hook: 'evolve.py',
+  hook: 'hooks/evolve.py',
   heartbeat_ms: 30 * 60 * 1000,
   hook_timeout: 30_000,
   heartbeat_title: 'heartbeat',
@@ -45,7 +45,7 @@ function loadConfig(workspace: string): EvolveConfig {
 
 const WORKSPACE = process.env.OPENCODE_EVOLVE_WORKSPACE || process.env.OPENCODE_SIDECAR_WORKSPACE || path.join(homedir(), 'workspace')
 const CONFIG = loadConfig(WORKSPACE)
-const HOOK_PATH = path.join(WORKSPACE, 'hooks', CONFIG.hook)
+const HOOK_PATH = path.join(WORKSPACE, CONFIG.hook)
 const RUNTIME_PATH = path.join(WORKSPACE, 'config', 'runtime.json')
 const TOOL_PREFIX = path.parse(CONFIG.hook).name
 const LOG_PREFIX = '[evolve]'
@@ -122,16 +122,16 @@ async function validateHook(hookContent: string): Promise<{ ok: boolean, output:
   const testScript = path.join(WORKSPACE, CONFIG.test_script)
   const tmp = mkdtempSync(path.join(tmpdir(), 'evolve-validate-'))
   try {
-    mkdirSync(path.join(tmp, 'hooks'), { recursive: true })
+    const hookPath = path.join(tmp, CONFIG.hook)
+    mkdirSync(path.dirname(hookPath), { recursive: true })
     if (existsSync(path.join(WORKSPACE, 'traits')))
       cpSync(path.join(WORKSPACE, 'traits'), path.join(tmp, 'traits'), { recursive: true })
     if (existsSync(path.join(WORKSPACE, 'prompts')))
       cpSync(path.join(WORKSPACE, 'prompts'), path.join(tmp, 'prompts'), { recursive: true })
-    const hookPath = path.join(tmp, 'hooks', CONFIG.hook)
     writeFileSync(hookPath, hookContent)
     chmodSync(hookPath, 0o755)
     const { ok, output } = await new Promise<{ ok: boolean, output: string }>((resolve) => {
-      const proc = spawn('python3', [testScript, tmp], {
+      const proc = spawn('python3', [testScript], {
         env: { ...process.env, OPENCODE_EVOLVE_WORKSPACE: tmp },
         stdio: ['pipe', 'pipe', 'pipe'],
       })
