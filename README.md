@@ -244,7 +244,7 @@ the plugin provides these tools regardless of what the hook returns. they use th
 
 ## git integration
 
-the workspace is auto-initialized as a git repo. after tool execution and heartbeats, changes are committed automatically.
+the workspace is auto-initialized as a git repo. when a new repo is created, any pre-existing files are committed as an "initial" snapshot before any tool-triggered commits, so the diff history clearly shows what was present before vs what is new. after tool execution and heartbeats, changes are committed automatically.
 
 ## actions
 

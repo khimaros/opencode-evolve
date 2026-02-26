@@ -494,6 +494,9 @@ export const EvolvePlugin: Plugin = async ({ client, directory }) => {
   debug(`workspace: ${WORKSPACE}`)
   debug(`hook: ${CONFIG.hook} (prefix: ${TOOL_PREFIX})`)
 
+  // snapshot pre-existing files before any tools modify the workspace
+  await commitWorkspace('initial')
+
   const registeredTools = await discoverTools()
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
 
