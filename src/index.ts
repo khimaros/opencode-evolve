@@ -130,13 +130,23 @@ async function validateHook(hookContent: string): Promise<{ ok: boolean, output:
     const hookPath = path.join(tmp, 'hooks', CONFIG.hook)
     writeFileSync(hookPath, hookContent)
     chmodSync(hookPath, 0o755)
-    const { stdout, stderr } = await execFileAsync('python3', [testScript, tmp], {
-      env: { ...process.env, OPENCODE_EVOLVE_WORKSPACE: tmp },
-      timeout: CONFIG.hook_timeout,
+    const { ok, output } = await new Promise<{ ok: boolean, output: string }>((resolve) => {
+      const proc = spawn('python3', [testScript, tmp], {
+        env: { ...process.env, OPENCODE_EVOLVE_WORKSPACE: tmp },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = '', stderr = '', done = false
+      const timer = setTimeout(() => {
+        if (!done) { proc.kill(); resolve({ ok: false, output: stdout + stderr + 'timeout' }) }
+      }, CONFIG.hook_timeout)
+      proc.stdout.on('data', (d: Buffer) => stdout += d)
+      proc.stderr.on('data', (d: Buffer) => stderr += d)
+      proc.on('error', (e) => { done = true; clearTimeout(timer); resolve({ ok: false, output: stdout + stderr + e.message }) })
+      proc.on('close', (code) => { done = true; clearTimeout(timer); resolve({ ok: code === 0, output: stdout + stderr }) })
     })
-    return { ok: true, output: stdout + stderr }
+    return { ok, output }
   } catch (e: any) {
-    return { ok: false, output: (e.stdout || '') + (e.stderr || '') + (e.message || '') }
+    return { ok: false, output: e.message || 'unknown error' }
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
