@@ -17,7 +17,6 @@ interface EvolveConfig {
   hook_timeout: number
   heartbeat_title: string
   heartbeat_agent: string
-  avatar: string
   test_script: string | null
 }
 
@@ -27,7 +26,6 @@ const DEFAULTS: EvolveConfig = {
   hook_timeout: 30_000,
   heartbeat_title: 'heartbeat',
   heartbeat_agent: 'evolve',
-  avatar: '🌀',
   test_script: null,
 }
 
@@ -50,7 +48,7 @@ const CONFIG = loadConfig(WORKSPACE)
 const HOOK_PATH = path.join(WORKSPACE, 'hooks', CONFIG.hook)
 const RUNTIME_PATH = path.join(WORKSPACE, 'config', 'runtime.json')
 const TOOL_PREFIX = path.parse(CONFIG.hook).name
-const LOG_PREFIX = `[${CONFIG.avatar}]`
+const LOG_PREFIX = '[evolve]'
 const AGENT_MARKER = '<~ PERSONA AGENT MARKER ~>'
 // observational hooks — failure should not trigger recover cascade
 const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification'])
@@ -180,7 +178,7 @@ function parseHookOutput(name: string, stdout: string): any {
   for (const line of stdout.split('\n')) {
     if (!line.trim()) continue
     const obj = JSON.parse(line)
-    if (obj.log) { debug(`hook ${name}: ${obj.log}`); continue }
+    if (obj.log) { debug(obj.log); continue }
     Object.assign(result, obj)
   }
   return result
@@ -309,13 +307,14 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       args,
       async execute(toolArgs) {
         try {
+          debug(`tool ${TOOL_PREFIX}_${def.name} execute`)
           const result = await callHook('execute_tool', { tool: def.name, args: toolArgs })
           if (result.modified?.length) trackModified(result.modified)
           if (result.notify?.length) queueNotifications(result.notify)
           await commitWorkspace(`update ${def.name}`)
-          return `${CONFIG.avatar} ${result.result || 'done'}`
+          return result.result || 'done'
         } catch (e: any) {
-          return `${CONFIG.avatar} tool error: ${e.message}`
+          return `tool error: ${e.message}`
         }
       },
     })
@@ -329,10 +328,10 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       debug('prompt_list')
       try {
         const files = readdirSync(path.join(WORKSPACE, 'prompts')).filter(f => f.endsWith('.md')).sort()
-        return `${CONFIG.avatar} available prompts: ${files.join(', ')}`
+        return `available prompts: ${files.join(', ')}`
       } catch (e: any) {
         debug(`prompt_list error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -345,10 +344,10 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     async execute({ prompt }) {
       debug(`prompt_read: ${prompt}`)
       try {
-        return `${CONFIG.avatar}\n${readFileSync(path.join(WORKSPACE, 'prompts', prompt), 'utf-8')}`
+        return `${readFileSync(path.join(WORKSPACE, 'prompts', prompt), 'utf-8')}`
       } catch (e: any) {
         debug(`prompt_read error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -367,10 +366,10 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
         queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }])
         await commitWorkspace(`write prompt ${prompt}`)
         debug(`prompt_write ok: ${prompt}`)
-        return `${CONFIG.avatar} successfully wrote ${prompt}`
+        return `successfully wrote ${prompt}`
       } catch (e: any) {
         debug(`prompt_write error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -387,16 +386,16 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       try {
         const content = readFileSync(path.join(WORKSPACE, 'prompts', prompt), 'utf-8')
         const result = patchContent(content, old_string, new_string)
-        if (typeof result !== 'string') { debug(`prompt_patch failed: ${result.error}`); return `${CONFIG.avatar} failed: ${result.error}` }
+        if (typeof result !== 'string') { debug(`prompt_patch failed: ${result.error}`); return `failed: ${result.error}` }
         writeFileSync(path.join(WORKSPACE, 'prompts', prompt), result)
         trackModified([`prompts/${prompt}`])
         queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }])
         await commitWorkspace(`patch prompt ${prompt}`)
         debug(`prompt_patch ok: ${prompt}`)
-        return `${CONFIG.avatar} successfully patched ${prompt}`
+        return `successfully patched ${prompt}`
       } catch (e: any) {
         debug(`prompt_patch error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -410,12 +409,12 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       debug('hook_validate')
       try {
         const validation = await validateHook(content)
-        if (validation.ok) { debug('hook_validate: passed'); return `${CONFIG.avatar} validation passed` }
+        if (validation.ok) { debug('hook_validate: passed'); return `validation passed` }
         debug('hook_validate: failed')
-        return `${CONFIG.avatar} validation failed:\n${validation.output}`
+        return `validation failed:\n${validation.output}`
       } catch (e: any) {
         debug(`hook_validate error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -426,10 +425,10 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     async execute() {
       debug('hook_read')
       try {
-        return `${CONFIG.avatar}\n${readFileSync(HOOK_PATH, 'utf-8')}`
+        return `${readFileSync(HOOK_PATH, 'utf-8')}`
       } catch (e: any) {
         debug(`hook_read error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -443,15 +442,15 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       debug('hook_write: validating')
       try {
         const validation = await validateHook(content)
-        if (!validation.ok) { debug(`hook_write: validation failed`); return `${CONFIG.avatar} validation failed:\n${validation.output}` }
+        if (!validation.ok) { debug(`hook_write: validation failed`); return `validation failed:\n${validation.output}` }
         writeFileSync(HOOK_PATH, content)
         chmodSync(HOOK_PATH, 0o755)
         await commitWorkspace(`write hook ${CONFIG.hook}`)
         debug('hook_write ok')
-        return `${CONFIG.avatar} successfully wrote hook`
+        return `successfully wrote hook`
       } catch (e: any) {
         debug(`hook_write error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -467,17 +466,17 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       try {
         const content = readFileSync(HOOK_PATH, 'utf-8')
         const result = patchContent(content, old_string, new_string)
-        if (typeof result !== 'string') { debug(`hook_patch failed: ${result.error}`); return `${CONFIG.avatar} failed: ${result.error}` }
+        if (typeof result !== 'string') { debug(`hook_patch failed: ${result.error}`); return `failed: ${result.error}` }
         const validation = await validateHook(result)
-        if (!validation.ok) { debug(`hook_patch: validation failed`); return `${CONFIG.avatar} validation failed:\n${validation.output}` }
+        if (!validation.ok) { debug(`hook_patch: validation failed`); return `validation failed:\n${validation.output}` }
         writeFileSync(HOOK_PATH, result)
         chmodSync(HOOK_PATH, 0o755)
         await commitWorkspace(`patch hook ${CONFIG.hook}`)
         debug('hook_patch ok')
-        return `${CONFIG.avatar} successfully patched hook`
+        return `successfully patched hook`
       } catch (e: any) {
         debug(`hook_patch error: ${e.message}`)
-        return `${CONFIG.avatar} error: ${e.message}`
+        return `error: ${e.message}`
       }
     },
   })
@@ -505,7 +504,7 @@ export const EvolvePlugin: Plugin = async ({ client, directory }) => {
   setInterval(async () => {
     if (heartbeatInProgress) { debug('heartbeat skipped: already in progress'); return }
     heartbeatInProgress = true
-    debug('heartbeat tick')
+    debug(`heartbeat tick (${lastModel?.providerID}/${lastModel?.modelID})`)
     try {
       if (!heartbeatSessionId) {
         debug('heartbeat: resolving session')
