@@ -644,8 +644,9 @@ export const EvolvePlugin: Plugin = async ({ client, directory }) => {
             notifications,
           }, input.sessionID)
           if (formatted.message) {
+            const wrapped = `<internal-notification>\n${formatted.message}\n</internal-notification>`
             injectOnNextTransform.push([
-              [{ type: 'text', text: formatted.message, synthetic: true }],
+              [{ type: 'text', text: wrapped, synthetic: true }],
             ])
             debug(`queued notification for ${input.sessionID}: ${formatted.message}`)
           }
