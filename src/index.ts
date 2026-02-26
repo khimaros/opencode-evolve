@@ -107,7 +107,7 @@ async function commitWorkspace(message: string) {
     await gitExec('diff', '--cached', '--quiet').catch(async () => {
       await gitExec('commit', '-m', message)
       const diff = await gitExec('show', '--color=always', '--pretty=format:', 'HEAD')
-      diff.trim().split('\n').forEach(l => console.log(`${LOG_PREFIX} ${l}`))
+      diff.trim().split('\n').forEach(l => debug(l))
     })
   } catch (e: any) {
     debug(`git error: ${e.message}`)
