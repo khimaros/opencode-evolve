@@ -305,12 +305,12 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     tools[`${TOOL_PREFIX}_${def.name}`] = tool({
       description: def.description,
       args,
-      async execute(toolArgs) {
+      async execute(toolArgs, context) {
         try {
-          debug(`tool ${TOOL_PREFIX}_${def.name} execute`)
-          const result = await callHook('execute_tool', { tool: def.name, args: toolArgs })
+          debug(`tool ${TOOL_PREFIX}_${def.name} execute session=${context.sessionID}`)
+          const result = await callHook('execute_tool', { tool: def.name, args: toolArgs, session: { id: context.sessionID } }, context.sessionID)
           if (result.modified?.length) trackModified(result.modified)
-          if (result.notify?.length) queueNotifications(result.notify)
+          if (result.notify?.length) queueNotifications(result.notify, context.sessionID)
           await commitWorkspace(`update ${def.name}`)
           return result.result || 'done'
         } catch (e: any) {
@@ -358,12 +358,12 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       prompt: tool.schema.string().describe('prompt filename (e.g. chat.md)'),
       content: tool.schema.string().describe('full content for the prompt'),
     },
-    async execute({ prompt, content }) {
+    async execute({ prompt, content }, context) {
       debug(`prompt_write: ${prompt}`)
       try {
         writeFileSync(path.join(WORKSPACE, 'prompts', prompt), content)
         trackModified([`prompts/${prompt}`])
-        queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }])
+        queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }], context.sessionID)
         await commitWorkspace(`write prompt ${prompt}`)
         debug(`prompt_write ok: ${prompt}`)
         return `successfully wrote ${prompt}`
@@ -381,7 +381,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
       old_string: tool.schema.string().describe('the text to replace'),
       new_string: tool.schema.string().describe('the new text to replace with'),
     },
-    async execute({ prompt, old_string, new_string }) {
+    async execute({ prompt, old_string, new_string }, context) {
       debug(`prompt_patch: ${prompt}`)
       try {
         const content = readFileSync(path.join(WORKSPACE, 'prompts', prompt), 'utf-8')
@@ -389,7 +389,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
         if (typeof result !== 'string') { debug(`prompt_patch failed: ${result.error}`); return `failed: ${result.error}` }
         writeFileSync(path.join(WORKSPACE, 'prompts', prompt), result)
         trackModified([`prompts/${prompt}`])
-        queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }])
+        queueNotifications([{ type: 'trait_changed', files: [`prompts/${prompt}`] }], context.sessionID)
         await commitWorkspace(`patch prompt ${prompt}`)
         debug(`prompt_patch ok: ${prompt}`)
         return `successfully patched ${prompt}`
