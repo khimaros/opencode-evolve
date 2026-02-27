@@ -510,14 +510,15 @@ export const EvolvePlugin: Plugin = async ({ client, directory }) => {
   setInterval(async () => {
     if (heartbeatInProgress) { debug('heartbeat skipped: already in progress'); return }
     heartbeatInProgress = true
-    debug(`heartbeat tick (${lastModel?.providerID}/${lastModel?.modelID})`)
+    const heartbeatModel = loadModel() || lastModel
+    debug(`heartbeat tick (${heartbeatModel?.providerID}/${heartbeatModel?.modelID})`)
     try {
       if (!heartbeatSessionId) {
         debug('heartbeat: resolving session')
         heartbeatSessionId = await findOrCreateSession(client, CONFIG.heartbeat_title)
         debug(`heartbeat: session=${heartbeatSessionId}`)
       }
-      if (!lastModel) {
+      if (!heartbeatModel) {
         debug('heartbeat skipped: no model captured yet')
         return
       }
@@ -527,7 +528,7 @@ export const EvolvePlugin: Plugin = async ({ client, directory }) => {
         const parts = [{ type: 'text' as const, text: `[heartbeat] ${result.user}`, synthetic: true }]
         await client.session.prompt({
           path: { id: heartbeatSessionId },
-          body: { agent: CONFIG.heartbeat_agent, model: lastModel, parts },
+          body: { agent: CONFIG.heartbeat_agent, model: heartbeatModel, parts },
         })
         debug('heartbeat sent')
       }
