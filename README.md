@@ -2,6 +2,8 @@
 
 self-modifying hook plugin for [opencode](https://opencode.ai). gives LLM agents the ability to modify their own hooks and prompts (with test validation), discover and invoke custom tools, and evolve their behavior at runtime.
 
+for a comprehensive production example se [persona](https://github.com/khimaros/persona)
+
 ## installation
 
 add to your `opencode.jsonc`:
