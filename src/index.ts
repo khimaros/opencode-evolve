@@ -19,6 +19,9 @@ interface EvolveConfig {
   heartbeat_title: string
   heartbeat_agent: string
   test_script: string | null
+  heartbeat_cleanup: 'none' | 'reset' | 'compact'
+  heartbeat_cleanup_count: number | null
+  heartbeat_cleanup_tokens: number | null
 }
 
 const DEFAULTS: EvolveConfig = {
@@ -28,6 +31,9 @@ const DEFAULTS: EvolveConfig = {
   heartbeat_title: 'heartbeat',
   heartbeat_agent: 'evolve',
   test_script: null,
+  heartbeat_cleanup: 'none',
+  heartbeat_cleanup_count: null,
+  heartbeat_cleanup_tokens: null,
 }
 
 function loadConfig(workspace: string): EvolveConfig {
@@ -59,26 +65,36 @@ function debug(msg: string) {
   console.log(`${LOG_PREFIX}: ${msg}`)
 }
 
-// --- model persistence ---
+// --- runtime persistence ---
 
-function loadModel(): any {
+function loadRuntime(): any {
   try {
-    return JSON.parse(readFileSync(RUNTIME_PATH, 'utf-8')).model
+    return JSON.parse(readFileSync(RUNTIME_PATH, 'utf-8'))
   } catch {
-    return undefined
+    return {}
   }
 }
 
-function persistModel(model: { providerID: string, modelID: string }) {
+function persistRuntime(patch: Record<string, any>) {
   try {
-    const current = loadModel()
-    if (current?.providerID === model.providerID && current?.modelID === model.modelID) return
+    const current = loadRuntime()
+    const updated = { ...current, ...patch }
     mkdirSync(path.dirname(RUNTIME_PATH), { recursive: true })
-    writeFileSync(RUNTIME_PATH, JSON.stringify({ model }, null, 2) + '\n')
-    debug(`persisted model: ${model.providerID}/${model.modelID}`)
+    writeFileSync(RUNTIME_PATH, JSON.stringify(updated, null, 2) + '\n')
   } catch (e: any) {
-    debug(`persist model failed: ${e.message}`)
+    debug(`persist runtime failed: ${e.message}`)
   }
+}
+
+function loadModel(): any {
+  return loadRuntime().model
+}
+
+function persistModel(model: { providerID: string, modelID: string }) {
+  const current = loadModel()
+  if (current?.providerID === model.providerID && current?.modelID === model.modelID) return
+  persistRuntime({ model })
+  debug(`persisted model: ${model.providerID}/${model.modelID}`)
 }
 
 // --- git ---
@@ -279,6 +295,53 @@ function queueNotifications(notifications: any[], sourceSessionId?: string) {
   }
 }
 
+// --- heartbeat cleanup ---
+
+async function shouldCleanup(client: any, sessionId: string): Promise<boolean> {
+  if (CONFIG.heartbeat_cleanup === 'none') return false
+  // both null = every tick
+  if (CONFIG.heartbeat_cleanup_count === null && CONFIG.heartbeat_cleanup_tokens === null) return true
+  if (CONFIG.heartbeat_cleanup_count !== null) {
+    const count = loadRuntime().heartbeat_count || 0
+    if (count >= CONFIG.heartbeat_cleanup_count) {
+      debug(`heartbeat cleanup: ${count} heartbeats >= ${CONFIG.heartbeat_cleanup_count}`)
+      return true
+    }
+  }
+  if (CONFIG.heartbeat_cleanup_tokens !== null) {
+    const msgs = await client.session.messages({ path: { id: sessionId } })
+    let total = 0
+    for (const m of (msgs.data || [])) {
+      const t = m.info?.tokens
+      if (t) total += (t.input || 0) + (t.output || 0)
+    }
+    if (total >= CONFIG.heartbeat_cleanup_tokens) {
+      debug(`heartbeat cleanup: ${total} tokens >= ${CONFIG.heartbeat_cleanup_tokens}`)
+      return true
+    }
+  }
+  return false
+}
+
+async function performCleanup(client: any, sessionId: string, model: any): Promise<string | null> {
+  if (CONFIG.heartbeat_cleanup === 'reset') {
+    debug('heartbeat cleanup: resetting session')
+    await client.session.delete({ path: { id: sessionId } })
+    const newId = await findOrCreateSession(client, CONFIG.heartbeat_title)
+    debug(`heartbeat cleanup: new session=${newId}`)
+    return newId
+  }
+  if (CONFIG.heartbeat_cleanup === 'compact') {
+    debug('heartbeat cleanup: compacting session')
+    await client.session.summarize({
+      path: { id: sessionId },
+      body: { providerID: model.providerID, modelID: model.modelID },
+    })
+    debug('heartbeat cleanup: compaction triggered')
+  }
+  return null
+}
+
 // --- plugin ---
 
 // build opencode tool registrations from hook-defined tool definitions
@@ -326,6 +389,14 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     })
   }
   // --- builtin tools (escape hatch — work even if hook is bricked) ---
+
+  tools[`${TOOL_PREFIX}_datetime`] = tool({
+    description: `get the current date and time in UTC`,
+    args: {},
+    async execute() {
+      return new Date().toISOString()
+    },
+  })
 
   tools[`${TOOL_PREFIX}_prompt_list`] = tool({
     description: `list prompts in the ${TOOL_PREFIX} workspace`,
@@ -525,6 +596,11 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         debug('heartbeat skipped: no model captured yet')
         return
       }
+      if (await shouldCleanup(client, heartbeatSessionId)) {
+        const newId = await performCleanup(client, heartbeatSessionId, heartbeatModel)
+        if (newId) heartbeatSessionId = newId
+        persistRuntime({ heartbeat_count: 0 })
+      }
       const result = await callHook('heartbeat', { sessions: [] }, heartbeatSessionId)
       if (!result.user) debug('heartbeat: hook returned no user message')
       if (result.user) {
@@ -534,6 +610,8 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
           body: { agent: CONFIG.heartbeat_agent, model: heartbeatModel, parts },
         })
         debug('heartbeat sent')
+        const count = (loadRuntime().heartbeat_count || 0) + 1
+        persistRuntime({ heartbeat_count: count, heartbeat_time: new Date().toISOString() })
       }
       if (result.modified?.length) trackModified(result.modified)
       if (result.notify?.length) queueNotifications(result.notify, heartbeatSessionId!)

@@ -40,7 +40,9 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
   "hook_timeout": 30000,          // subprocess timeout (30s)
   "heartbeat_title": "heartbeat", // heartbeat session title
   "heartbeat_agent": "evolve",    // agent ID for heartbeat prompts
-  "avatar": "🌀",                 // log/tool output prefix
+  "heartbeat_cleanup": "none",    // "none" | "reset" | "compact"
+  "heartbeat_cleanup_count": null, // cleanup after N heartbeats (null = disabled)
+  "heartbeat_cleanup_tokens": null,// cleanup after N total tokens (null = disabled)
   "test_script": null              // path to test script for hook validation
 }
 ```
@@ -235,6 +237,7 @@ tools are defined by the hook's `discover` response. each tool gets a prefixed n
 
 the plugin provides these tools regardless of what the hook returns. they use the same prefix:
 
+- `<prefix>_datetime` — get the current date and time in UTC
 - `<prefix>_prompt_list` — list prompt files in the workspace
 - `<prefix>_prompt_read` — read a prompt file
 - `<prefix>_prompt_write` — write a prompt file
