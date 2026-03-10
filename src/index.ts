@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import { createOpencodeClient } from "@opencode-ai/sdk"
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { homedir } from 'os'
@@ -161,7 +162,7 @@ function patchContent(content: string, oldString: string, newString: string): st
 // (Bun's execFile doesn't pipe input; spawn ignores the timeout option)
 function spawnHook(name: string, input: string): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(HOOK_PATH, [name], { stdio: ['pipe', 'pipe', 'inherit'] })
+    const proc = spawn(HOOK_PATH, [name], { cwd: WORKSPACE, stdio: ['pipe', 'pipe', 'inherit'] })
     let stdout = '', done = false
     const timer = setTimeout(() => {
       if (!done) { proc.kill(); reject(new Error('timeout')) }
@@ -492,7 +493,9 @@ function trackModified(_files: string[]) {
   // git commit handled by caller — no prompt cache invalidation needed
 }
 
-export const EvolvePlugin: Plugin = async ({ client, directory }) => {
+export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, serverUrl }) => {
+  // workspace-scoped client for session operations (heartbeat, actions, etc.)
+  const client = createOpencodeClient({ baseUrl: serverUrl.toString(), directory: WORKSPACE })
   debug(`evolve initialized in ${directory}`)
   debug(`workspace: ${WORKSPACE}`)
   debug(`hook: ${CONFIG.hook} (prefix: ${TOOL_PREFIX})`)
