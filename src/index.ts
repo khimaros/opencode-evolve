@@ -398,6 +398,15 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     },
   })
 
+  tools[`${TOOL_PREFIX}_heartbeat_time`] = tool({
+    description: `get the last heartbeat runtime in UTC`,
+    args: {},
+    async execute() {
+      const runtime = loadRuntime()
+      return runtime.heartbeat_time ?? 'no heartbeat has run yet'
+    },
+  })
+
   tools[`${TOOL_PREFIX}_prompt_list`] = tool({
     description: `list prompts in the ${TOOL_PREFIX} workspace`,
     args: {},

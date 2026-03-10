@@ -1,5 +1,9 @@
 # roadmap
 
+## in progress
+
+- [ ] builtin tool to get last heartbeat runtime in UTC
+
 ## done
 
 - [x] set cwd to WORKSPACE for all hook spawns (including heartbeat)
