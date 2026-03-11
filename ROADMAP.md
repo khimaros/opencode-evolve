@@ -2,9 +2,11 @@
 
 ## in progress
 
-- [ ] builtin tool to get last heartbeat runtime in UTC
 ## done
 
+- [x] builtin tool to get last heartbeat runtime in UTC
+- [x] fix heartbeat cleanup (delete/archive) by checking for API errors
+- [x] prevent heartbeat cleanup of busy sessions
 - [x] archive cleanup mode for heartbeat sessions
 - [x] prevent overlapping heartbeat executions
 - [x] skip heartbeat when other sessions are active

@@ -111,6 +111,32 @@ const statuses = await client.session.status()
 
 sessions absent from the status map are idle.
 
+### update & archive
+
+sessions are updated via `client.session.update()`. this is used for renaming
+and archiving.
+
+```typescript
+// rename session
+await client.session.update({
+  path: { id: sessionId },
+  body: { title: "new title" },
+})
+
+// archive session (hides from active list in webui)
+await client.session.update({
+  path: { id: sessionId },
+  body: { time: { archived: Date.now() } },
+})
+```
+
+### delete
+
+```typescript
+// delete session and all associated messages
+await client.session.delete({ path: { id: sessionId } })
+```
+
 ### messages
 
 ```typescript

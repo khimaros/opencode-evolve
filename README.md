@@ -238,6 +238,7 @@ tools are defined by the hook's `discover` response. each tool gets a prefixed n
 the plugin provides these tools regardless of what the hook returns. they use the same prefix:
 
 - `<prefix>_datetime` — get the current date and time in UTC
+- `<prefix>_heartbeat_time` — get the last heartbeat runtime in UTC
 - `<prefix>_prompt_list` — list prompt files in the workspace
 - `<prefix>_prompt_read` — read a prompt file
 - `<prefix>_prompt_write` — write a prompt file

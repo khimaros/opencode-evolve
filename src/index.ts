@@ -243,13 +243,15 @@ async function executeActions(client: any, actions: any[]) {
     try {
       if (action.type === 'send') {
         const parts = [{ type: 'text' as const, text: action.message, synthetic: action.synthetic ?? true }]
-        await client.session.prompt({
+        const resp = await client.session.prompt({
           path: { id: action.session_id },
           body: { agent: CONFIG.heartbeat_agent, parts },
         })
+        if (resp.error) throw new Error(`send failed: ${JSON.stringify(resp.error)}`)
         debug(`sent message to session ${action.session_id}`)
       } else if (action.type === 'create_session') {
         const created = await client.session.create({ body: { title: action.title } })
+        if (created.error) throw new Error(`create_session failed: ${JSON.stringify(created.error)}`)
         debug(`created session ${created.data?.id}`)
       }
     } catch (e: any) {
@@ -262,6 +264,7 @@ async function executeActions(client: any, actions: any[]) {
 
 async function createSession(client: any, title: string): Promise<string> {
   const created = await client.session.create({ body: { title } })
+  if (created.error) throw new Error(`create session failed: ${JSON.stringify(created.error)}`)
   return created.data!.id
 }
 
@@ -301,19 +304,23 @@ async function shouldCleanup(client: any, sessionId: string): Promise<boolean> {
   if (CONFIG.heartbeat_cleanup_count !== null) {
     const count = loadRuntime().heartbeat_count || 0
     if (count >= CONFIG.heartbeat_cleanup_count) {
-      debug(`heartbeat cleanup: ${count} heartbeats >= ${CONFIG.heartbeat_cleanup_count}`)
+      debug(`heartbeat cleanup: count limit reached (${count} >= ${CONFIG.heartbeat_cleanup_count})`)
       return true
     }
   }
   if (CONFIG.heartbeat_cleanup_tokens !== null) {
     const msgs = await client.session.messages({ path: { id: sessionId } })
+    if (msgs.error) {
+      debug(`heartbeat cleanup check failed (list messages): ${JSON.stringify(msgs.error)}`)
+      return false
+    }
     let total = 0
     for (const m of (msgs.data || [])) {
       const t = m.info?.tokens
       if (t) total += (t.input || 0) + (t.output || 0)
     }
     if (total >= CONFIG.heartbeat_cleanup_tokens) {
-      debug(`heartbeat cleanup: ${total} tokens >= ${CONFIG.heartbeat_cleanup_tokens}`)
+      debug(`heartbeat cleanup: token limit reached (${total} >= ${CONFIG.heartbeat_cleanup_tokens})`)
       return true
     }
   }
@@ -322,27 +329,45 @@ async function shouldCleanup(client: any, sessionId: string): Promise<boolean> {
 
 async function performCleanup(client: any, sessionId: string, model: any): Promise<string | null> {
   if (CONFIG.heartbeat_cleanup === 'delete') {
-    debug('heartbeat cleanup: deleting session')
-    await client.session.delete({ path: { id: sessionId } })
-    const newId = await createSession(client, CONFIG.heartbeat_title)
-    debug(`heartbeat cleanup: deleted=${sessionId} new=${newId}`)
+    debug(`heartbeat cleanup: attempting to delete session ${sessionId}`)
+    const resp = await client.session.delete({ path: { id: sessionId } })
+    if (resp.error) {
+      debug(`heartbeat cleanup delete failed: ${JSON.stringify(resp.error)}`)
+      return null
+    }
+    const newTitle = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
+    const newId = await createSession(client, newTitle)
+    debug(`heartbeat cleanup successful: deleted=${sessionId} new=${newId}`)
     return newId
   }
   if (CONFIG.heartbeat_cleanup === 'archive') {
-    debug('heartbeat cleanup: archiving session')
-    const ts = new Date().toISOString().replace(/[:.]/g, '-')
-    const archiveTitle = `[archived] ${CONFIG.heartbeat_title} ${ts}`
-    await client.session.update({ path: { id: sessionId }, body: { title: archiveTitle } })
-    const newId = await createSession(client, CONFIG.heartbeat_title)
-    debug(`heartbeat cleanup: archived=${sessionId} new=${newId}`)
+    debug(`heartbeat cleanup: attempting to archive session ${sessionId}`)
+    // set archived timestamp to hide it from the active list in webui (no rename)
+    const update = await client.session.update({
+      path: { id: sessionId },
+      body: {
+        time: { archived: Date.now() }
+      } as any
+    })
+    if (update.error) {
+      debug(`heartbeat cleanup archive failed: ${JSON.stringify(update.error)}`)
+      return null
+    }
+    const newTitle = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
+    const newId = await createSession(client, newTitle)
+    debug(`heartbeat cleanup successful: archived=${sessionId} new=${newId}`)
     return newId
   }
   if (CONFIG.heartbeat_cleanup === 'compact') {
-    debug('heartbeat cleanup: compacting session')
-    await client.session.summarize({
+    debug(`heartbeat cleanup: attempting to compact session ${sessionId}`)
+    const summarize = await client.session.summarize({
       path: { id: sessionId },
       body: { providerID: model.providerID, modelID: model.modelID },
     })
+    if (summarize.error) {
+      debug(`heartbeat cleanup compact failed: ${JSON.stringify(summarize.error)}`)
+      return null
+    }
     debug('heartbeat cleanup: compaction triggered')
   }
   return null
@@ -598,11 +623,11 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   let lastModel: any = loadModel()
 
   // skip heartbeat when any other session has an active LLM call
-  async function hasActiveSessions(): Promise<boolean> {
+  async function hasActiveSessions(includeHeartbeat = false): Promise<boolean> {
     const resp = await client.session.status({})
     if (!resp.data) return false
     for (const [id, status] of Object.entries(resp.data as Record<string, { type: string }>)) {
-      if (id === heartbeatSessionId) continue
+      if (!includeHeartbeat && id === heartbeatSessionId) continue
       if (status.type !== 'idle') return true
     }
     return false
@@ -618,7 +643,8 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         return
       }
       if (!heartbeatSessionId) {
-        heartbeatSessionId = await createSession(client, CONFIG.heartbeat_title)
+        const title = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
+        heartbeatSessionId = await createSession(client, title)
         persistRuntime({ heartbeat_session: heartbeatSessionId })
         debug(`heartbeat: session=${heartbeatSessionId}`)
       }
@@ -627,6 +653,11 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         return
       }
       if (await shouldCleanup(client, heartbeatSessionId)) {
+        // if cleanup is needed, ensure the heartbeat session itself is idle
+        if (await hasActiveSessions(true)) {
+          debug('heartbeat cleanup skipped: heartbeat session is busy')
+          return
+        }
         const newId = await performCleanup(client, heartbeatSessionId, heartbeatModel)
         if (newId) heartbeatSessionId = newId
         persistRuntime({ heartbeat_count: 0, heartbeat_session: heartbeatSessionId })
