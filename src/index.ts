@@ -19,7 +19,7 @@ interface EvolveConfig {
   heartbeat_title: string
   heartbeat_agent: string
   test_script: string | null
-  heartbeat_cleanup: 'none' | 'delete' | 'archive' | 'compact'
+  heartbeat_cleanup: 'none' | 'new' | 'archive' | 'compact'
   heartbeat_cleanup_count: number | null
   heartbeat_cleanup_tokens: number | null
 }
@@ -299,8 +299,8 @@ function queueNotifications(notifications: any[], sourceSessionId?: string) {
 
 async function shouldCleanup(client: any, sessionId: string): Promise<boolean> {
   if (CONFIG.heartbeat_cleanup === 'none') return false
-  // both null = every tick
-  if (CONFIG.heartbeat_cleanup_count === null && CONFIG.heartbeat_cleanup_tokens === null) return true
+
+  // check triggers independently and simultaneously
   if (CONFIG.heartbeat_cleanup_count !== null) {
     const count = loadRuntime().heartbeat_count || 0
     if (count >= CONFIG.heartbeat_cleanup_count) {
@@ -328,36 +328,6 @@ async function shouldCleanup(client: any, sessionId: string): Promise<boolean> {
 }
 
 async function performCleanup(client: any, sessionId: string, model: any): Promise<string | null> {
-  if (CONFIG.heartbeat_cleanup === 'delete') {
-    debug(`heartbeat cleanup: attempting to delete session ${sessionId}`)
-    const resp = await client.session.delete({ path: { id: sessionId } })
-    if (resp.error) {
-      debug(`heartbeat cleanup delete failed: ${JSON.stringify(resp.error)}`)
-      return null
-    }
-    const newTitle = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
-    const newId = await createSession(client, newTitle)
-    debug(`heartbeat cleanup successful: deleted=${sessionId} new=${newId}`)
-    return newId
-  }
-  if (CONFIG.heartbeat_cleanup === 'archive') {
-    debug(`heartbeat cleanup: attempting to archive session ${sessionId}`)
-    // set archived timestamp to hide it from the active list in webui (no rename)
-    const update = await client.session.update({
-      path: { id: sessionId },
-      body: {
-        time: { archived: Date.now() }
-      } as any
-    })
-    if (update.error) {
-      debug(`heartbeat cleanup archive failed: ${JSON.stringify(update.error)}`)
-      return null
-    }
-    const newTitle = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
-    const newId = await createSession(client, newTitle)
-    debug(`heartbeat cleanup successful: archived=${sessionId} new=${newId}`)
-    return newId
-  }
   if (CONFIG.heartbeat_cleanup === 'compact') {
     debug(`heartbeat cleanup: attempting to compact session ${sessionId}`)
     const summarize = await client.session.summarize({
@@ -369,8 +339,31 @@ async function performCleanup(client: any, sessionId: string, model: any): Promi
       return null
     }
     debug('heartbeat cleanup: compaction triggered')
+    return null // stay in current session
   }
-  return null
+
+  if (CONFIG.heartbeat_cleanup !== 'new' && CONFIG.heartbeat_cleanup !== 'archive') return null
+
+  if (CONFIG.heartbeat_cleanup === 'archive') {
+    debug(`heartbeat cleanup: attempting to archive session ${sessionId}`)
+    // set archived timestamp to hide it from the active list in webui
+    const update = await client.session.update({
+      path: { id: sessionId },
+      body: {
+        time: { archived: Date.now() }
+      } as any
+    })
+    if (update.error) {
+      debug(`heartbeat cleanup archive failed: ${JSON.stringify(update.error)}`)
+      return null
+    }
+  }
+
+  // rotate: create new session for 'new' or 'archive' actions
+  const newTitle = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
+  const newId = await createSession(client, newTitle)
+  debug(`heartbeat cleanup successful: action=${CONFIG.heartbeat_cleanup} old=${sessionId} new=${newId}`)
+  return newId
 }
 
 // --- plugin ---

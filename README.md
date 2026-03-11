@@ -40,12 +40,20 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
   "hook_timeout": 30000,          // subprocess timeout (30s)
   "heartbeat_title": "heartbeat", // heartbeat session title
   "heartbeat_agent": "evolve",    // agent ID for heartbeat prompts
-  "heartbeat_cleanup": "none",    // "none" | "delete" | "archive" | "compact"
+  "heartbeat_cleanup": "none",     // "none" | "new" | "archive" | "compact"
   "heartbeat_cleanup_count": null, // cleanup after N heartbeats (null = disabled)
   "heartbeat_cleanup_tokens": null,// cleanup after N total tokens (null = disabled)
   "test_script": null              // path to test script for hook validation
 }
 ```
+
+`heartbeat_cleanup` defines what happens when a threshold is reached:
+- `none`: thresholds are ignored; heartbeat accumulates indefinitely in one session.
+- `new`: starts a new heartbeat session; the old one remains active.
+- `archive`: starts a new heartbeat session and archives the old one (hides it in WebUI).
+- `compact`: triggers server-side compaction on the current session.
+
+`heartbeat_cleanup_count` and `heartbeat_cleanup_tokens` are evaluated independently; the first threshold reached triggers the action.
 
 `heartbeat_agent` must match a configured agent in your `opencode.jsonc`. for example:
 
