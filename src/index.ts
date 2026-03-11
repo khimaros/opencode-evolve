@@ -571,14 +571,16 @@ function trackModified(_files: string[]) {
 }
 
 export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, serverUrl }) => {
-  // workspace-scoped client for session operations (heartbeat, actions, etc.)
-  const client = createOpencodeClient({ baseUrl: serverUrl.toString(), directory: WORKSPACE })
   debug(`evolve initialized in ${directory}`)
   debug(`workspace: ${WORKSPACE}`)
   debug(`hook: ${CONFIG.hook} (prefix: ${TOOL_PREFIX})`)
 
-  // snapshot pre-existing files before any tools modify the workspace
+  // ensure git repo exists before creating client so the server resolves
+  // the workspace as a real project instead of falling back to global "/"
   await commitWorkspace('initial')
+
+  // workspace-scoped client for session operations (heartbeat, actions, etc.)
+  const client = createOpencodeClient({ baseUrl: serverUrl.toString(), directory: WORKSPACE })
 
   const registeredTools = await discoverTools()
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
