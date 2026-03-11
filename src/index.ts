@@ -19,7 +19,7 @@ interface EvolveConfig {
   heartbeat_title: string
   heartbeat_agent: string
   test_script: string | null
-  heartbeat_cleanup: 'none' | 'reset' | 'compact'
+  heartbeat_cleanup: 'none' | 'delete' | 'archive' | 'compact'
   heartbeat_cleanup_count: number | null
   heartbeat_cleanup_tokens: number | null
 }
@@ -321,11 +321,20 @@ async function shouldCleanup(client: any, sessionId: string): Promise<boolean> {
 }
 
 async function performCleanup(client: any, sessionId: string, model: any): Promise<string | null> {
-  if (CONFIG.heartbeat_cleanup === 'reset') {
-    debug('heartbeat cleanup: resetting session')
+  if (CONFIG.heartbeat_cleanup === 'delete') {
+    debug('heartbeat cleanup: deleting session')
     await client.session.delete({ path: { id: sessionId } })
     const newId = await createSession(client, CONFIG.heartbeat_title)
-    debug(`heartbeat cleanup: new session=${newId}`)
+    debug(`heartbeat cleanup: deleted=${sessionId} new=${newId}`)
+    return newId
+  }
+  if (CONFIG.heartbeat_cleanup === 'archive') {
+    debug('heartbeat cleanup: archiving session')
+    const ts = new Date().toISOString().replace(/[:.]/g, '-')
+    const archiveTitle = `[archived] ${CONFIG.heartbeat_title} ${ts}`
+    await client.session.update({ path: { id: sessionId }, body: { title: archiveTitle } })
+    const newId = await createSession(client, CONFIG.heartbeat_title)
+    debug(`heartbeat cleanup: archived=${sessionId} new=${newId}`)
     return newId
   }
   if (CONFIG.heartbeat_cleanup === 'compact') {
@@ -586,15 +595,28 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
 
   let heartbeatSessionId: string | null = loadRuntime().heartbeat_session || null
-  let heartbeatInProgress = false
   let lastModel: any = loadModel()
 
-  setInterval(async () => {
-    if (heartbeatInProgress) { debug('heartbeat skipped: already in progress'); return }
-    heartbeatInProgress = true
+  // skip heartbeat when any other session has an active LLM call
+  async function hasActiveSessions(): Promise<boolean> {
+    const resp = await client.session.status({})
+    if (!resp.data) return false
+    for (const [id, status] of Object.entries(resp.data as Record<string, { type: string }>)) {
+      if (id === heartbeatSessionId) continue
+      if (status.type !== 'idle') return true
+    }
+    return false
+  }
+
+  // use setTimeout chaining to guarantee only one heartbeat runs at a time
+  async function heartbeatTick() {
     const heartbeatModel = loadModel() || lastModel
     debug(`heartbeat tick (${heartbeatModel?.providerID}/${heartbeatModel?.modelID})`)
     try {
+      if (await hasActiveSessions()) {
+        debug('heartbeat skipped: other sessions are active')
+        return
+      }
       if (!heartbeatSessionId) {
         heartbeatSessionId = await createSession(client, CONFIG.heartbeat_title)
         persistRuntime({ heartbeat_session: heartbeatSessionId })
@@ -633,9 +655,10 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
     } catch (e: any) {
       debug(`heartbeat failed: ${e.message}`)
     } finally {
-      heartbeatInProgress = false
+      setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
     }
-  }, CONFIG.heartbeat_ms)
+  }
+  setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
 
   return {
     tool: registeredTools,
