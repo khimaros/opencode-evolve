@@ -636,26 +636,26 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   // use setTimeout chaining to guarantee only one heartbeat runs at a time
   async function heartbeatTick() {
     const heartbeatModel = loadModel() || lastModel
-    debug(`heartbeat tick (${heartbeatModel?.providerID}/${heartbeatModel?.modelID})`)
+    debug(`heartbeat: tick start (${heartbeatModel?.providerID}/${heartbeatModel?.modelID})`)
     try {
       if (await hasActiveSessions()) {
-        debug('heartbeat skipped: other sessions are active')
+        debug('heartbeat: tick skipped (other sessions active)')
         return
       }
       if (!heartbeatSessionId) {
         const title = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
         heartbeatSessionId = await createSession(client, title)
         persistRuntime({ heartbeat_session: heartbeatSessionId })
-        debug(`heartbeat: session=${heartbeatSessionId}`)
+        debug(`heartbeat: session created id=${heartbeatSessionId}`)
       }
       if (!heartbeatModel) {
-        debug('heartbeat skipped: no model captured yet')
+        debug('heartbeat: tick skipped (no model captured)')
         return
       }
       if (await shouldCleanup(client, heartbeatSessionId)) {
         // if cleanup is needed, ensure the heartbeat session itself is idle
         if (await hasActiveSessions(true)) {
-          debug('heartbeat cleanup skipped: heartbeat session is busy')
+          debug('heartbeat: cleanup skipped (heartbeat session busy)')
           return
         }
         const newId = await performCleanup(client, heartbeatSessionId, heartbeatModel)
@@ -671,12 +671,12 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
           body: { agent: CONFIG.heartbeat_agent, model: heartbeatModel, parts },
         })
         if (resp.error) {
-          debug(`heartbeat prompt failed: ${JSON.stringify(resp.error)}`)
+          debug(`heartbeat: prompt failed: ${JSON.stringify(resp.error)}`)
           heartbeatSessionId = null
           persistRuntime({ heartbeat_session: null })
           return
         }
-        debug('heartbeat sent')
+        debug('heartbeat: prompt sent')
         const count = (loadRuntime().heartbeat_count || 0) + 1
         persistRuntime({ heartbeat_count: count, heartbeat_time: new Date().toISOString() })
       }
@@ -684,8 +684,9 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
       if (result.notify?.length) queueNotifications(result.notify, heartbeatSessionId!)
       if (result.actions?.length) await executeActions(client, result.actions)
     } catch (e: any) {
-      debug(`heartbeat failed: ${e.message}`)
+      debug(`heartbeat: tick failed: ${e.message}`)
     } finally {
+      debug('heartbeat: tick finish')
       setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
     }
   }
