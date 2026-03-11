@@ -260,10 +260,7 @@ async function executeActions(client: any, actions: any[]) {
 
 // --- session helpers ---
 
-async function findOrCreateSession(client: any, title: string): Promise<string> {
-  const sessions = await client.session.list()
-  const existing = sessions.data?.find((s: any) => s.title === title)
-  if (existing) return existing.id
+async function createSession(client: any, title: string): Promise<string> {
   const created = await client.session.create({ body: { title } })
   return created.data!.id
 }
@@ -327,7 +324,7 @@ async function performCleanup(client: any, sessionId: string, model: any): Promi
   if (CONFIG.heartbeat_cleanup === 'reset') {
     debug('heartbeat cleanup: resetting session')
     await client.session.delete({ path: { id: sessionId } })
-    const newId = await findOrCreateSession(client, CONFIG.heartbeat_title)
+    const newId = await createSession(client, CONFIG.heartbeat_title)
     debug(`heartbeat cleanup: new session=${newId}`)
     return newId
   }
@@ -586,7 +583,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   const registeredTools = await discoverTools()
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
 
-  let heartbeatSessionId: string | null = null
+  let heartbeatSessionId: string | null = loadRuntime().heartbeat_session || null
   let heartbeatInProgress = false
   let lastModel: any = loadModel()
 
@@ -597,8 +594,8 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
     debug(`heartbeat tick (${heartbeatModel?.providerID}/${heartbeatModel?.modelID})`)
     try {
       if (!heartbeatSessionId) {
-        debug('heartbeat: resolving session')
-        heartbeatSessionId = await findOrCreateSession(client, CONFIG.heartbeat_title)
+        heartbeatSessionId = await createSession(client, CONFIG.heartbeat_title)
+        persistRuntime({ heartbeat_session: heartbeatSessionId })
         debug(`heartbeat: session=${heartbeatSessionId}`)
       }
       if (!heartbeatModel) {
@@ -608,16 +605,22 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
       if (await shouldCleanup(client, heartbeatSessionId)) {
         const newId = await performCleanup(client, heartbeatSessionId, heartbeatModel)
         if (newId) heartbeatSessionId = newId
-        persistRuntime({ heartbeat_count: 0 })
+        persistRuntime({ heartbeat_count: 0, heartbeat_session: heartbeatSessionId })
       }
       const result = await callHook('heartbeat', { sessions: [] }, heartbeatSessionId)
       if (!result.user) debug('heartbeat: hook returned no user message')
       if (result.user) {
         const parts = [{ type: 'text' as const, text: `[heartbeat] ${result.user}`, synthetic: true }]
-        await client.session.prompt({
+        const resp = await client.session.prompt({
           path: { id: heartbeatSessionId },
           body: { agent: CONFIG.heartbeat_agent, model: heartbeatModel, parts },
         })
+        if (resp.error) {
+          debug(`heartbeat prompt failed: ${JSON.stringify(resp.error)}`)
+          heartbeatSessionId = null
+          persistRuntime({ heartbeat_session: null })
+          return
+        }
         debug('heartbeat sent')
         const count = (loadRuntime().heartbeat_count || 0) + 1
         persistRuntime({ heartbeat_count: count, heartbeat_time: new Date().toISOString() })
