@@ -48,6 +48,16 @@ function loadConfig(workspace: string): EvolveConfig {
   }
 }
 
+// resolve prompt path, rejecting traversal outside the prompts directory
+function safePromptPath(prompt: string): string {
+  const base = path.join(WORKSPACE, 'prompts')
+  const resolved = path.resolve(base, prompt)
+  if (!resolved.startsWith(base + path.sep) && resolved !== base) {
+    throw new Error('invalid prompt path')
+  }
+  return resolved
+}
+
 // --- state ---
 
 const WORKSPACE = process.env.OPENCODE_EVOLVE_WORKSPACE || process.env.OPENCODE_SIDECAR_WORKSPACE || path.join(homedir(), 'workspace')
@@ -454,7 +464,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     async execute({ prompt }) {
       debug(`prompt_read: ${prompt}`)
       try {
-        return `${readFileSync(path.join(WORKSPACE, 'prompts', prompt), 'utf-8')}`
+        return `${readFileSync(safePromptPath(prompt), 'utf-8')}`
       } catch (e: any) {
         debug(`prompt_read error: ${e.message}`)
         return `error: ${e.message}`
@@ -471,7 +481,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     async execute({ prompt, content }, context) {
       debug(`prompt_write: ${prompt}`)
       try {
-        writeFileSync(path.join(WORKSPACE, 'prompts', prompt), content)
+        writeFileSync(safePromptPath(prompt), content)
         trackModified([`prompts/${prompt}`])
         await commitWorkspace(`write prompt ${prompt}`)
         debug(`prompt_write ok: ${prompt}`)
@@ -493,10 +503,10 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     async execute({ prompt, old_string, new_string }, context) {
       debug(`prompt_patch: ${prompt}`)
       try {
-        const content = readFileSync(path.join(WORKSPACE, 'prompts', prompt), 'utf-8')
+        const content = readFileSync(safePromptPath(prompt), 'utf-8')
         const result = patchContent(content, old_string, new_string)
         if (typeof result !== 'string') { debug(`prompt_patch failed: ${result.error}`); return `failed: ${result.error}` }
-        writeFileSync(path.join(WORKSPACE, 'prompts', prompt), result)
+        writeFileSync(safePromptPath(prompt), result)
         trackModified([`prompts/${prompt}`])
         await commitWorkspace(`patch prompt ${prompt}`)
         debug(`prompt_patch ok: ${prompt}`)
