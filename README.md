@@ -2,7 +2,7 @@
 
 self-modifying hook plugin for [opencode](https://opencode.ai). gives LLM agents the ability to modify their own hooks and prompts (with test validation), discover and invoke custom tools, and evolve their behavior at runtime.
 
-for a comprehensive production example se [persona](https://github.com/khimaros/persona)
+for a comprehensive production example see [persona](https://github.com/khimaros/persona)
 
 ## installation
 
@@ -21,8 +21,9 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
 ```
 ~/workspace/
 ├── config/
-│   ├── evolve.jsonc        # evolve settings
-│   └── runtime.json        # runtime state (auto-managed)
+│   └── evolve.jsonc        # evolve settings
+├── state/
+│   └── evolve.json         # runtime state (auto-managed)
 ├── hooks/
 │   └── evolve.py           # hook script
 ├── prompts/                # prompt templates
@@ -31,11 +32,12 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
 
 ## configuration
 
-`config/evolve.jsonc` — all fields optional:
+`config/evolve.jsonc` — all fields optional, all overridable via `EVOLVE_*` env vars:
 
 ```jsonc
 {
   "hook": "hooks/evolve.py",      // hook script path (workspace-relative)
+  "model": null,                   // "provider/model" or { providerID, modelID } (auto-detected if omitted)
   "heartbeat_ms": 1800000,        // heartbeat interval (30 min)
   "hook_timeout": 30000,          // subprocess timeout (30s)
   "heartbeat_title": "heartbeat", // heartbeat session title
@@ -46,6 +48,8 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
   "test_script": null              // path to test script for hook validation
 }
 ```
+
+env var overrides: `EVOLVE_MODEL`, `EVOLVE_HOOK`, `EVOLVE_HEARTBEAT_AGENT`. env vars always take precedence over config file values.
 
 `heartbeat_cleanup` defines what happens when a threshold is reached:
 - `none`: thresholds are ignored; heartbeat accumulates indefinitely in one session.
