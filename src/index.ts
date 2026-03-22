@@ -38,22 +38,41 @@ const DEFAULTS: EvolveConfig = {
   heartbeat_cleanup_tokens: null,
 }
 
+// env var mapping: EVOLVE_FIELD_NAME -> config field
+const ENV_OVERRIDES: Record<string, keyof EvolveConfig> = {
+  EVOLVE_MODEL: 'model',
+  EVOLVE_HOOK: 'hook',
+  EVOLVE_HEARTBEAT_AGENT: 'heartbeat_agent',
+}
+
+function applyEnvOverrides(config: any) {
+  for (const [envVar, field] of Object.entries(ENV_OVERRIDES)) {
+    const val = process.env[envVar]
+    if (val !== undefined) config[field] = val
+  }
+}
+
+function normalizeModel(config: any) {
+  if (typeof config.model === 'string' && config.model.includes('/')) {
+    const [providerID, ...rest] = config.model.split('/')
+    config.model = { providerID, modelID: rest.join('/') }
+  }
+}
+
 function loadConfig(workspace: string): EvolveConfig {
   const configPath = path.join(workspace, 'config', 'evolve.jsonc')
+  let parsed: any
   try {
     const raw = readFileSync(configPath, 'utf-8')
     // strip jsonc comments (// and /* */)
     const json = raw.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')
-    const parsed = { ...DEFAULTS, ...JSON.parse(json) }
-    // normalize model: accept "provider/model" string or { providerID, modelID } object
-    if (typeof parsed.model === 'string' && parsed.model.includes('/')) {
-      const [providerID, ...rest] = parsed.model.split('/')
-      parsed.model = { providerID, modelID: rest.join('/') }
-    }
-    return parsed
+    parsed = { ...DEFAULTS, ...JSON.parse(json) }
   } catch {
-    return { ...DEFAULTS }
+    parsed = { ...DEFAULTS }
   }
+  applyEnvOverrides(parsed)
+  normalizeModel(parsed)
+  return parsed
 }
 
 // resolve prompt path, rejecting traversal outside the prompts directory
