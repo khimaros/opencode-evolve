@@ -19,7 +19,7 @@ interface EvolveConfig {
   heartbeat_title: string
   heartbeat_agent: string
   test_script: string | null
-  heartbeat_model: { providerID: string; modelID: string } | null
+  model: { providerID: string; modelID: string } | null
   heartbeat_cleanup: 'none' | 'new' | 'archive' | 'compact'
   heartbeat_cleanup_count: number | null
   heartbeat_cleanup_tokens: number | null
@@ -32,7 +32,7 @@ const DEFAULTS: EvolveConfig = {
   heartbeat_title: 'heartbeat',
   heartbeat_agent: 'evolve',
   test_script: null,
-  heartbeat_model: null,
+  model: null,
   heartbeat_cleanup: 'none',
   heartbeat_cleanup_count: null,
   heartbeat_cleanup_tokens: null,
@@ -46,9 +46,9 @@ function loadConfig(workspace: string): EvolveConfig {
     const json = raw.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')
     const parsed = { ...DEFAULTS, ...JSON.parse(json) }
     // normalize model: accept "provider/model" string or { providerID, modelID } object
-    if (typeof parsed.heartbeat_model === 'string' && parsed.heartbeat_model.includes('/')) {
-      const [providerID, ...rest] = parsed.heartbeat_model.split('/')
-      parsed.heartbeat_model = { providerID, modelID: rest.join('/') }
+    if (typeof parsed.model === 'string' && parsed.model.includes('/')) {
+      const [providerID, ...rest] = parsed.model.split('/')
+      parsed.model = { providerID, modelID: rest.join('/') }
     }
     return parsed
   } catch {
@@ -632,7 +632,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
 
   let heartbeatSessionId: string | null = loadRuntime().heartbeat_session || null
-  let lastModel: any = CONFIG.heartbeat_model || loadModel()
+  let lastModel: any = CONFIG.model || loadModel()
 
   // skip heartbeat when any other session has an active LLM call
   async function hasActiveSessions(includeHeartbeat = false): Promise<boolean> {
