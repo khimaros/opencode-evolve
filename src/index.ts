@@ -19,6 +19,7 @@ interface EvolveConfig {
   heartbeat_title: string
   heartbeat_agent: string
   test_script: string | null
+  heartbeat_model: { providerID: string; modelID: string } | null
   heartbeat_cleanup: 'none' | 'new' | 'archive' | 'compact'
   heartbeat_cleanup_count: number | null
   heartbeat_cleanup_tokens: number | null
@@ -31,6 +32,7 @@ const DEFAULTS: EvolveConfig = {
   heartbeat_title: 'heartbeat',
   heartbeat_agent: 'evolve',
   test_script: null,
+  heartbeat_model: null,
   heartbeat_cleanup: 'none',
   heartbeat_cleanup_count: null,
   heartbeat_cleanup_tokens: null,
@@ -42,7 +44,13 @@ function loadConfig(workspace: string): EvolveConfig {
     const raw = readFileSync(configPath, 'utf-8')
     // strip jsonc comments (// and /* */)
     const json = raw.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')
-    return { ...DEFAULTS, ...JSON.parse(json) }
+    const parsed = { ...DEFAULTS, ...JSON.parse(json) }
+    // normalize model: accept "provider/model" string or { providerID, modelID } object
+    if (typeof parsed.heartbeat_model === 'string' && parsed.heartbeat_model.includes('/')) {
+      const [providerID, ...rest] = parsed.heartbeat_model.split('/')
+      parsed.heartbeat_model = { providerID, modelID: rest.join('/') }
+    }
+    return parsed
   } catch {
     return { ...DEFAULTS }
   }
@@ -63,7 +71,7 @@ function safePromptPath(prompt: string): string {
 const WORKSPACE = process.env.OPENCODE_EVOLVE_WORKSPACE || process.env.OPENCODE_SIDECAR_WORKSPACE || path.join(homedir(), 'workspace')
 const CONFIG = loadConfig(WORKSPACE)
 const HOOK_PATH = path.join(WORKSPACE, CONFIG.hook)
-const RUNTIME_PATH = path.join(WORKSPACE, 'config', 'runtime.json')
+const STATE_PATH = path.join(WORKSPACE, 'state', 'evolve.json')
 const TOOL_PREFIX = path.parse(CONFIG.hook).name
 const LOG_PREFIX = '[evolve]'
 // observational hooks — failure should not trigger recover cascade
@@ -79,7 +87,7 @@ function debug(msg: string) {
 
 function loadRuntime(): any {
   try {
-    return JSON.parse(readFileSync(RUNTIME_PATH, 'utf-8'))
+    return JSON.parse(readFileSync(STATE_PATH, 'utf-8'))
   } catch {
     return {}
   }
@@ -89,8 +97,8 @@ function persistRuntime(patch: Record<string, any>) {
   try {
     const current = loadRuntime()
     const updated = { ...current, ...patch }
-    mkdirSync(path.dirname(RUNTIME_PATH), { recursive: true })
-    writeFileSync(RUNTIME_PATH, JSON.stringify(updated, null, 2) + '\n')
+    mkdirSync(path.dirname(STATE_PATH), { recursive: true })
+    writeFileSync(STATE_PATH, JSON.stringify(updated, null, 2) + '\n')
   } catch (e: any) {
     debug(`persist runtime failed: ${e.message}`)
   }
@@ -617,13 +625,14 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   await commitWorkspace('initial')
 
   // workspace-scoped client for session operations (heartbeat, actions, etc.)
+  // WARNING: this only works if --port= is specified explicitly to `opencode serve`
   const client = createOpencodeClient({ baseUrl: serverUrl.toString(), directory: WORKSPACE })
 
   const registeredTools = await discoverTools()
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
 
   let heartbeatSessionId: string | null = loadRuntime().heartbeat_session || null
-  let lastModel: any = loadModel()
+  let lastModel: any = CONFIG.heartbeat_model || loadModel()
 
   // skip heartbeat when any other session has an active LLM call
   async function hasActiveSessions(includeHeartbeat = false): Promise<boolean> {
