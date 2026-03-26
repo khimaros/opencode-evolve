@@ -38,17 +38,18 @@ const DEFAULTS: EvolveConfig = {
   heartbeat_cleanup_tokens: null,
 }
 
-// env var mapping: EVOLVE_FIELD_NAME -> config field
-const ENV_OVERRIDES: Record<string, keyof EvolveConfig> = {
-  EVOLVE_MODEL: 'model',
-  EVOLVE_HOOK: 'hook',
-  EVOLVE_HEARTBEAT_AGENT: 'heartbeat_agent',
+// coerce env string to match the type of the existing config value
+function coerceEnv(val: string, existing: any): any {
+  if (existing === null || typeof existing === 'string') return val === 'null' ? null : val
+  if (typeof existing === 'number') return val === 'null' ? null : Number(val)
+  return val
 }
 
+// apply EVOLVE_<FIELD> env vars to config (e.g. EVOLVE_HEARTBEAT_MS -> heartbeat_ms)
 function applyEnvOverrides(config: any) {
-  for (const [envVar, field] of Object.entries(ENV_OVERRIDES)) {
-    const val = process.env[envVar]
-    if (val !== undefined) config[field] = val
+  for (const field of Object.keys(DEFAULTS)) {
+    const val = process.env[`EVOLVE_${field.toUpperCase()}`]
+    if (val !== undefined) config[field] = coerceEnv(val, DEFAULTS[field as keyof EvolveConfig])
   }
 }
 
@@ -638,6 +639,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   debug(`evolve initialized in ${directory}`)
   debug(`workspace: ${WORKSPACE}`)
   debug(`hook: ${CONFIG.hook} (prefix: ${TOOL_PREFIX})`)
+  if (CONFIG.heartbeat_ms < 0) debug('heartbeat: disabled (heartbeat_ms < 0)')
 
   // ensure git repo exists before creating client so the server resolves
   // the workspace as a real project instead of falling back to global "/"
@@ -721,11 +723,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
       if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
     }
   }
-  if (CONFIG.heartbeat_ms >= 0) {
-    setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
-  } else {
-    debug('heartbeat: disabled (heartbeat_ms < 0)')
-  }
+  if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
 
   return {
     tool: registeredTools,
