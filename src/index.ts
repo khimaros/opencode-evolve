@@ -721,7 +721,11 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
       if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
     }
   }
-  if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+  if (CONFIG.heartbeat_ms >= 0) {
+    setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+  } else {
+    debug('heartbeat: disabled (heartbeat_ms < 0)')
+  }
 
   return {
     tool: registeredTools,
