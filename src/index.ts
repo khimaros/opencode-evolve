@@ -27,7 +27,7 @@ interface EvolveConfig {
 
 const DEFAULTS: EvolveConfig = {
   hook: 'hooks/evolve.py',
-  heartbeat_ms: 30 * 60 * 1000,
+  heartbeat_ms: 120 * 60 * 1000,
   hook_timeout: 30_000,
   heartbeat_title: 'heartbeat',
   heartbeat_agent: 'evolve',
@@ -718,10 +718,10 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
       debug(`heartbeat: tick failed: ${e.message}`)
     } finally {
       debug('heartbeat: tick finish')
-      setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+      if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
     }
   }
-  setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+  if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
 
   return {
     tool: registeredTools,
