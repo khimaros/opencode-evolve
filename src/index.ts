@@ -787,10 +787,16 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
       debug(`heartbeat: tick failed: ${e.message}`)
     } finally {
       debug('heartbeat: tick finish')
-      if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+      if (CONFIG.heartbeat_ms >= 0) {
+        debug(`heartbeat: next tick scheduled at ${new Date(Date.now() + CONFIG.heartbeat_ms).toISOString()}`)
+        setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+      }
     }
   }
-  if (CONFIG.heartbeat_ms >= 0) setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+  if (CONFIG.heartbeat_ms >= 0) {
+    debug(`heartbeat: initial tick scheduled at ${new Date(Date.now() + CONFIG.heartbeat_ms).toISOString()}`)
+    setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
+  }
 
   return {
     tool: registeredTools,
