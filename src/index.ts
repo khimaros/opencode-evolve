@@ -76,13 +76,20 @@ function loadConfig(workspace: string): EvolveConfig {
   return parsed
 }
 
-// resolve prompt path, rejecting traversal outside the prompts directory
-function safePromptPath(prompt: string): string {
-  const base = path.join(WORKSPACE, 'prompts')
-  const resolved = path.resolve(base, prompt)
+// resolve a filename within a workspace subdirectory, rejecting traversal
+function safePath(dir: string, filename: string): string {
+  const base = path.join(WORKSPACE, dir)
+  const resolved = path.resolve(base, filename)
   if (!resolved.startsWith(base + path.sep) && resolved !== base) {
-    throw new Error('invalid prompt path')
+    throw new Error(`invalid ${dir} path: ${filename}`)
   }
+  return resolved
+}
+
+// require that a file already exists (no implicit creation)
+function existingPath(dir: string, filename: string): string {
+  const resolved = safePath(dir, filename)
+  if (!existsSync(resolved)) throw new Error(`not found: ${dir}/${filename}`)
   return resolved
 }
 
@@ -202,12 +209,12 @@ async function validateHook(hookContent: string): Promise<{ ok: boolean, output:
   }
 }
 
-// apply a single find-and-replace, returning the new content or an error
-function patchContent(content: string, oldString: string, newString: string): string | { error: string } {
+// find-and-replace with optional replaceAll support
+function editContent(content: string, oldString: string, newString: string, replaceAll = false): string | { error: string } {
   const n = content.split(oldString).length - 1
-  if (n === 0) return { error: 'old_string not found' }
-  if (n > 1) return { error: `${n} matches for old_string, expected 1` }
-  return content.replace(oldString, newString)
+  if (n === 0) return { error: 'oldString not found' }
+  if (n > 1 && !replaceAll) return { error: `${n} matches for oldString, expected 1 (use replaceAll to replace all)` }
+  return replaceAll ? content.replaceAll(oldString, newString) : content.replace(oldString, newString)
 }
 
 // --- hook IPC ---
@@ -430,8 +437,25 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   const tools: Record<string, ReturnType<typeof tool>> = {}
   for (const def of discovered.tools || []) {
     const args: Record<string, any> = {}
-    for (const [param, desc] of Object.entries(def.parameters || {})) {
-      args[param] = tool.schema.string().describe(desc as string)
+    for (const [param, spec] of Object.entries(def.parameters || {})) {
+      // backwards compat: bare string = string type with that description
+      if (typeof spec === 'string') {
+        args[param] = tool.schema.string().describe(spec)
+        continue
+      }
+      const { type, description, optional } = spec as { type?: string, description?: string, optional?: boolean }
+      const desc = description || param
+      const SCHEMA_TYPES: Record<string, () => any> = {
+        string: () => tool.schema.string().describe(desc),
+        number: () => tool.schema.number().describe(desc),
+        boolean: () => tool.schema.boolean().describe(desc),
+        object: () => tool.schema.record(tool.schema.string(), tool.schema.any()).describe(desc),
+        array: () => tool.schema.array(tool.schema.any()).describe(desc),
+        any: () => tool.schema.any().describe(desc),
+      }
+      let schema = (SCHEMA_TYPES[type || 'string'] || SCHEMA_TYPES.string)()
+      if (optional) schema = schema.optional()
+      args[param] = schema
     }
     tools[`${TOOL_PREFIX}_${def.name}`] = tool({
       description: def.description,
@@ -470,7 +494,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   })
 
   tools[`${TOOL_PREFIX}_prompt_list`] = tool({
-    description: `list prompts in the ${TOOL_PREFIX} workspace`,
+    description: `list prompt files in prompts/ (bare filenames like "chat.md")`,
     args: {},
     async execute() {
       debug('prompt_list')
@@ -485,14 +509,20 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   })
 
   tools[`${TOOL_PREFIX}_prompt_read`] = tool({
-    description: `read a prompt from the ${TOOL_PREFIX} workspace`,
+    description: `read an existing prompt file from prompts/ (must already exist)`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename (e.g. chat.md)'),
+      prompt: tool.schema.string().describe('prompt filename (e.g. "chat.md")'),
+      offset: tool.schema.number().optional().describe('line number to start reading from (1-indexed)'),
+      limit: tool.schema.number().optional().describe('max lines to read (default: all)'),
     },
-    async execute({ prompt }) {
+    async execute({ prompt, offset, limit }) {
       debug(`prompt_read: ${prompt}`)
       try {
-        return `${readFileSync(safePromptPath(prompt), 'utf-8')}`
+        const content = readFileSync(existingPath('prompts', prompt), 'utf-8')
+        const lines = content.split('\n')
+        const start = offset ? offset - 1 : 0
+        const sliced = limit ? lines.slice(start, start + limit) : lines.slice(start)
+        return sliced.join('\n')
       } catch (e: any) {
         debug(`prompt_read error: ${e.message}`)
         return `error: ${e.message}`
@@ -501,15 +531,16 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   })
 
   tools[`${TOOL_PREFIX}_prompt_write`] = tool({
-    description: `write a prompt in the ${TOOL_PREFIX} workspace`,
+    description: `overwrite an existing prompt file in prompts/ (cannot create new files)`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename (e.g. chat.md)'),
+      prompt: tool.schema.string().describe('prompt filename (e.g. "chat.md")'),
       content: tool.schema.string().describe('full content for the prompt'),
     },
-    async execute({ prompt, content }, context) {
+    async execute({ prompt, content }) {
       debug(`prompt_write: ${prompt}`)
       try {
-        writeFileSync(safePromptPath(prompt), content)
+        existingPath('prompts', prompt)
+        writeFileSync(safePath('prompts', prompt), content)
         trackModified([`prompts/${prompt}`])
         await commitWorkspace(`write prompt ${prompt}`)
         debug(`prompt_write ok: ${prompt}`)
@@ -521,33 +552,131 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
     },
   })
 
-  tools[`${TOOL_PREFIX}_prompt_patch`] = tool({
-    description: `patch a prompt in the ${TOOL_PREFIX} workspace`,
+  tools[`${TOOL_PREFIX}_prompt_edit`] = tool({
+    description: `edit an existing prompt file in prompts/ (find-and-replace, cannot create new files)`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename (e.g. chat.md)'),
-      old_string: tool.schema.string().describe('the text to replace'),
-      new_string: tool.schema.string().describe('the new text to replace with'),
+      prompt: tool.schema.string().describe('prompt filename (e.g. "chat.md")'),
+      oldString: tool.schema.string().describe('the text to replace'),
+      newString: tool.schema.string().describe('the text to replace it with (must be different from oldString)'),
+      replaceAll: tool.schema.boolean().optional().describe('replace all occurrences (default false)'),
     },
-    async execute({ prompt, old_string, new_string }, context) {
-      debug(`prompt_patch: ${prompt}`)
+    async execute({ prompt, oldString, newString, replaceAll }) {
+      debug(`prompt_edit: ${prompt}`)
       try {
-        const content = readFileSync(safePromptPath(prompt), 'utf-8')
-        const result = patchContent(content, old_string, new_string)
-        if (typeof result !== 'string') { debug(`prompt_patch failed: ${result.error}`); return `failed: ${result.error}` }
-        writeFileSync(safePromptPath(prompt), result)
+        const filePath = existingPath('prompts', prompt)
+        const content = readFileSync(filePath, 'utf-8')
+        const result = editContent(content, oldString, newString, replaceAll)
+        if (typeof result !== 'string') { debug(`prompt_edit failed: ${result.error}`); return `failed: ${result.error}` }
+        writeFileSync(filePath, result)
         trackModified([`prompts/${prompt}`])
-        await commitWorkspace(`patch prompt ${prompt}`)
-        debug(`prompt_patch ok: ${prompt}`)
-        return `successfully patched ${prompt}`
+        await commitWorkspace(`edit prompt ${prompt}`)
+        debug(`prompt_edit ok: ${prompt}`)
+        return `successfully edited ${prompt}`
       } catch (e: any) {
-        debug(`prompt_patch error: ${e.message}`)
+        debug(`prompt_edit error: ${e.message}`)
+        return `error: ${e.message}`
+      }
+    },
+  })
+
+  tools[`${TOOL_PREFIX}_hook_list`] = tool({
+    description: `list hook files in hooks/ (bare filenames like "persona.py")`,
+    args: {},
+    async execute() {
+      debug('hook_list')
+      try {
+        const files = readdirSync(path.join(WORKSPACE, 'hooks')).sort()
+        return `available hooks: ${files.join(', ')}`
+      } catch (e: any) {
+        debug(`hook_list error: ${e.message}`)
+        return `error: ${e.message}`
+      }
+    },
+  })
+
+  tools[`${TOOL_PREFIX}_hook_read`] = tool({
+    description: `read an existing hook file from hooks/ (must already exist)`,
+    args: {
+      hook: tool.schema.string().describe('hook filename (e.g. "persona.py")'),
+      offset: tool.schema.number().optional().describe('line number to start reading from (1-indexed)'),
+      limit: tool.schema.number().optional().describe('max lines to read (default: all)'),
+    },
+    async execute({ hook, offset, limit }) {
+      debug(`hook_read: ${hook}`)
+      try {
+        const content = readFileSync(existingPath('hooks', hook), 'utf-8')
+        const lines = content.split('\n')
+        const start = offset ? offset - 1 : 0
+        const sliced = limit ? lines.slice(start, start + limit) : lines.slice(start)
+        return sliced.join('\n')
+      } catch (e: any) {
+        debug(`hook_read error: ${e.message}`)
+        return `error: ${e.message}`
+      }
+    },
+  })
+
+  tools[`${TOOL_PREFIX}_hook_write`] = tool({
+    description: `overwrite an existing hook file in hooks/ (validated before install if it is the configured hook, cannot create new files)`,
+    args: {
+      hook: tool.schema.string().describe('hook filename (e.g. "persona.py")'),
+      content: tool.schema.string().describe('full content for the hook'),
+    },
+    async execute({ hook, content }) {
+      debug(`hook_write: ${hook}`)
+      try {
+        const filePath = existingPath('hooks', hook)
+        const isConfiguredHook = path.resolve(filePath) === path.resolve(HOOK_PATH)
+        if (isConfiguredHook) {
+          const validation = await validateHook(content)
+          if (!validation.ok) { debug('hook_write: validation failed'); return `validation failed:\n${validation.output}` }
+        }
+        writeFileSync(filePath, content)
+        chmodSync(filePath, 0o755)
+        await commitWorkspace(`write hook ${hook}`)
+        debug(`hook_write ok: ${hook}`)
+        return `successfully wrote ${hook}`
+      } catch (e: any) {
+        debug(`hook_write error: ${e.message}`)
+        return `error: ${e.message}`
+      }
+    },
+  })
+
+  tools[`${TOOL_PREFIX}_hook_edit`] = tool({
+    description: `edit an existing hook file in hooks/ (find-and-replace, validated before install if it is the configured hook, cannot create new files)`,
+    args: {
+      hook: tool.schema.string().describe('hook filename (e.g. "persona.py")'),
+      oldString: tool.schema.string().describe('the text to replace'),
+      newString: tool.schema.string().describe('the text to replace it with (must be different from oldString)'),
+      replaceAll: tool.schema.boolean().optional().describe('replace all occurrences (default false)'),
+    },
+    async execute({ hook, oldString, newString, replaceAll }) {
+      debug(`hook_edit: ${hook}`)
+      try {
+        const filePath = existingPath('hooks', hook)
+        const content = readFileSync(filePath, 'utf-8')
+        const result = editContent(content, oldString, newString, replaceAll)
+        if (typeof result !== 'string') { debug(`hook_edit failed: ${result.error}`); return `failed: ${result.error}` }
+        const isConfiguredHook = path.resolve(filePath) === path.resolve(HOOK_PATH)
+        if (isConfiguredHook) {
+          const validation = await validateHook(result)
+          if (!validation.ok) { debug('hook_edit: validation failed'); return `validation failed:\n${validation.output}` }
+        }
+        writeFileSync(filePath, result)
+        chmodSync(filePath, 0o755)
+        await commitWorkspace(`edit hook ${hook}`)
+        debug(`hook_edit ok: ${hook}`)
+        return `successfully edited ${hook}`
+      } catch (e: any) {
+        debug(`hook_edit error: ${e.message}`)
         return `error: ${e.message}`
       }
     },
   })
 
   tools[`${TOOL_PREFIX}_hook_validate`] = tool({
-    description: `validate a ${TOOL_PREFIX} hook without installing it`,
+    description: `validate hook content against the test suite without installing it`,
     args: {
       content: tool.schema.string().describe('full content for the hook to validate'),
     },
@@ -560,68 +689,6 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
         return `validation failed:\n${validation.output}`
       } catch (e: any) {
         debug(`hook_validate error: ${e.message}`)
-        return `error: ${e.message}`
-      }
-    },
-  })
-
-  tools[`${TOOL_PREFIX}_hook_read`] = tool({
-    description: `read the ${TOOL_PREFIX} hook`,
-    args: {},
-    async execute() {
-      debug('hook_read')
-      try {
-        return `${readFileSync(HOOK_PATH, 'utf-8')}`
-      } catch (e: any) {
-        debug(`hook_read error: ${e.message}`)
-        return `error: ${e.message}`
-      }
-    },
-  })
-
-  tools[`${TOOL_PREFIX}_hook_write`] = tool({
-    description: `write the ${TOOL_PREFIX} hook (validated before install)`,
-    args: {
-      content: tool.schema.string().describe('full content for the hook'),
-    },
-    async execute({ content }) {
-      debug('hook_write: validating')
-      try {
-        const validation = await validateHook(content)
-        if (!validation.ok) { debug(`hook_write: validation failed`); return `validation failed:\n${validation.output}` }
-        writeFileSync(HOOK_PATH, content)
-        chmodSync(HOOK_PATH, 0o755)
-        await commitWorkspace(`write hook ${CONFIG.hook}`)
-        debug('hook_write ok')
-        return `successfully wrote hook`
-      } catch (e: any) {
-        debug(`hook_write error: ${e.message}`)
-        return `error: ${e.message}`
-      }
-    },
-  })
-
-  tools[`${TOOL_PREFIX}_hook_patch`] = tool({
-    description: `patch the ${TOOL_PREFIX} hook (validated before install)`,
-    args: {
-      old_string: tool.schema.string().describe('the text to replace'),
-      new_string: tool.schema.string().describe('the new text to replace with'),
-    },
-    async execute({ old_string, new_string }) {
-      debug('hook_patch: validating')
-      try {
-        const content = readFileSync(HOOK_PATH, 'utf-8')
-        const result = patchContent(content, old_string, new_string)
-        if (typeof result !== 'string') { debug(`hook_patch failed: ${result.error}`); return `failed: ${result.error}` }
-        const validation = await validateHook(result)
-        if (!validation.ok) { debug(`hook_patch: validation failed`); return `validation failed:\n${validation.output}` }
-        writeFileSync(HOOK_PATH, result)
-        chmodSync(HOOK_PATH, 0o755)
-        await commitWorkspace(`patch hook ${CONFIG.hook}`)
-        debug('hook_patch ok')
-        return `successfully patched hook`
-      } catch (e: any) {
-        debug(`hook_patch error: ${e.message}`)
         return `error: ${e.message}`
       }
     },

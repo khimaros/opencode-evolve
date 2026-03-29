@@ -103,6 +103,13 @@ output:
 {"tools": [{"name": "my_tool", "description": "...", "parameters": {"arg": "description"}}]}
 ```
 
+parameters support two formats:
+
+- **string** (backwards compat): `{"arg": "description"}` — registers as a string param
+- **typed**: `{"arg": {"type": "string", "description": "...", "optional": true}}` — registers with the specified type
+
+supported types: `string`, `number`, `boolean`, `object`, `array`, `any`
+
 #### `mutate_request`
 
 called on each new session to generate the system prompt. return `{"system": [...]}` to manage the session, or `{}` to skip. the result is cached per-session (system prompt is frozen after first call).
@@ -237,8 +244,8 @@ input (after):
 
 the plugin provides builtin tools that let agents modify their own behavior at runtime:
 
-- **hook editing** — `hook_read`, `hook_write`, `hook_patch` let the agent rewrite its own hook script. writes are validated against the configured `test_script` before installation.
-- **prompt editing** — `prompt_list`, `prompt_read`, `prompt_write`, `prompt_patch` let the agent modify its own prompt templates.
+- **hook editing** — `hook_list`, `hook_read`, `hook_write`, `hook_edit` let the agent modify existing hook files. writes to the configured hook are validated against `test_script` before installation. new hooks cannot be created or deleted.
+- **prompt editing** — `prompt_list`, `prompt_read`, `prompt_write`, `prompt_edit` let the agent modify existing prompt templates. new prompts cannot be created or deleted.
 - **tool discovery** — custom tools defined by the hook's `discover` response are automatically registered with opencode.
 
 ## tool discovery
@@ -251,14 +258,15 @@ the plugin provides these tools regardless of what the hook returns. they use th
 
 - `<prefix>_datetime` — get the current date and time in UTC
 - `<prefix>_heartbeat_time` — get the last heartbeat runtime in UTC
-- `<prefix>_prompt_list` — list prompt files in the workspace
-- `<prefix>_prompt_read` — read a prompt file
-- `<prefix>_prompt_write` — write a prompt file
-- `<prefix>_prompt_patch` — patch a prompt file (find-and-replace)
-- `<prefix>_hook_validate` — validate a hook script without installing
-- `<prefix>_hook_read` — read the current hook script
-- `<prefix>_hook_write` — write a new hook (validated before install)
-- `<prefix>_hook_patch` — patch the hook (validated before install)
+- `<prefix>_prompt_list` — list prompt files in prompts/ (bare filenames)
+- `<prefix>_prompt_read` — read an existing prompt (supports offset/limit)
+- `<prefix>_prompt_write` — overwrite an existing prompt (cannot create new files)
+- `<prefix>_prompt_edit` — find-and-replace in an existing prompt (supports replaceAll)
+- `<prefix>_hook_list` — list hook files in hooks/ (bare filenames)
+- `<prefix>_hook_read` — read an existing hook (supports offset/limit)
+- `<prefix>_hook_write` — overwrite an existing hook (validated if configured hook, cannot create new files)
+- `<prefix>_hook_edit` — find-and-replace in an existing hook (validated if configured hook, supports replaceAll)
+- `<prefix>_hook_validate` — validate hook content against the test suite without installing
 
 ## git integration
 
