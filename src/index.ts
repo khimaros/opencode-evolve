@@ -511,7 +511,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   tools[`${TOOL_PREFIX}_prompt_read`] = tool({
     description: `read an existing prompt file from prompts/ (must already exist)`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename (e.g. "chat.md")'),
+      prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
       offset: tool.schema.number().optional().describe('line number to start reading from (1-indexed)'),
       limit: tool.schema.number().optional().describe('max lines to read (default: all)'),
     },
@@ -533,7 +533,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   tools[`${TOOL_PREFIX}_prompt_write`] = tool({
     description: `overwrite an existing prompt file in prompts/ (cannot create new files)`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename (e.g. "chat.md")'),
+      prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
       content: tool.schema.string().describe('full content for the prompt'),
     },
     async execute({ prompt, content }) {
@@ -555,7 +555,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   tools[`${TOOL_PREFIX}_prompt_edit`] = tool({
     description: `edit an existing prompt file in prompts/ (find-and-replace, cannot create new files)`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename (e.g. "chat.md")'),
+      prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
       oldString: tool.schema.string().describe('the text to replace'),
       newString: tool.schema.string().describe('the text to replace it with (must be different from oldString)'),
       replaceAll: tool.schema.boolean().optional().describe('replace all occurrences (default false)'),
@@ -597,7 +597,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   tools[`${TOOL_PREFIX}_hook_read`] = tool({
     description: `read an existing hook file from hooks/ (must already exist)`,
     args: {
-      hook: tool.schema.string().describe('hook filename (e.g. "persona.py")'),
+      hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
       offset: tool.schema.number().optional().describe('line number to start reading from (1-indexed)'),
       limit: tool.schema.number().optional().describe('max lines to read (default: all)'),
     },
@@ -619,7 +619,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   tools[`${TOOL_PREFIX}_hook_write`] = tool({
     description: `overwrite an existing hook file in hooks/ (validated before install if it is the configured hook, cannot create new files)`,
     args: {
-      hook: tool.schema.string().describe('hook filename (e.g. "persona.py")'),
+      hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
       content: tool.schema.string().describe('full content for the hook'),
     },
     async execute({ hook, content }) {
@@ -646,7 +646,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
   tools[`${TOOL_PREFIX}_hook_edit`] = tool({
     description: `edit an existing hook file in hooks/ (find-and-replace, validated before install if it is the configured hook, cannot create new files)`,
     args: {
-      hook: tool.schema.string().describe('hook filename (e.g. "persona.py")'),
+      hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
       oldString: tool.schema.string().describe('the text to replace'),
       newString: tool.schema.string().describe('the text to replace it with (must be different from oldString)'),
       replaceAll: tool.schema.boolean().optional().describe('replace all occurrences (default false)'),
