@@ -735,7 +735,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
 
   // use setTimeout chaining to guarantee only one heartbeat runs at a time
   async function heartbeatTick() {
-    const heartbeatModel = loadModel() || lastModel
+    const heartbeatModel = CONFIG.model || loadModel() || lastModel
     debug(`heartbeat: tick start (${heartbeatModel?.providerID}/${heartbeatModel?.modelID})`)
     try {
       if (await hasActiveSessions()) {
