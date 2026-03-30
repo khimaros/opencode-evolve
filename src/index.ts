@@ -196,10 +196,12 @@ async function commitWorkspace(message: string) {
 async function validateHook(hookContent: string): Promise<{ ok: boolean, output: string }> {
   if (!CONFIG.test_script) return { ok: true, output: 'no test_script configured' }
   const tmp = mkdtempSync(path.join(tmpdir(), 'evolve-validate-'))
+  debug(`validateHook: workspace=${WORKSPACE} tmp=${tmp}`)
   try {
     cpSync(WORKSPACE, tmp, { recursive: true })
     const testScript = path.join(tmp, CONFIG.test_script)
     const hookPath = path.join(tmp, CONFIG.hook)
+    debug(`validateHook: testScript=${testScript} hookPath=${hookPath}`)
     writeFileSync(hookPath, hookContent)
     chmodSync(hookPath, 0o755)
     const { ok, output } = await new Promise<{ ok: boolean, output: string }>((resolve) => {
