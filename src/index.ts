@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os'
 
 const execFileAsync = promisify(execFile)
 
+const DEFAULT_READ_LIMIT = 2000
+
 // --- config ---
 
 interface EvolveConfig {
@@ -535,8 +537,8 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     description: `read an existing prompt file from prompts/ (must already exist)`,
     args: {
       prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
-      offset: tool.schema.number().optional().describe('line number to start reading from (1-indexed)'),
-      limit: tool.schema.number().optional().describe('max lines to read (default: all)'),
+      offset: tool.schema.number().optional().describe('the line number to start reading from (1-indexed)'),
+      limit: tool.schema.number().optional().describe('the maximum number of lines to read (defaults to 2000)'),
     },
     async execute({ prompt, offset, limit }) {
       debug(`prompt_read: ${prompt}`)
@@ -544,7 +546,8 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
         const content = readFileSync(existingPath('prompts', prompt), 'utf-8')
         const lines = content.split('\n')
         const start = offset ? offset - 1 : 0
-        const sliced = limit ? lines.slice(start, start + limit) : lines.slice(start)
+        const end = start + (limit ?? DEFAULT_READ_LIMIT)
+        const sliced = lines.slice(start, end)
         return sliced.join('\n')
       } catch (e: any) {
         debug(`prompt_read error: ${e.message}`)
@@ -621,8 +624,8 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     description: `read an existing hook file from hooks/ (must already exist)`,
     args: {
       hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
-      offset: tool.schema.number().optional().describe('line number to start reading from (1-indexed)'),
-      limit: tool.schema.number().optional().describe('max lines to read (default: all)'),
+      offset: tool.schema.number().optional().describe('the line number to start reading from (1-indexed)'),
+      limit: tool.schema.number().optional().describe('the maximum number of lines to read (defaults to 2000)'),
     },
     async execute({ hook, offset, limit }) {
       debug(`hook_read: ${hook}`)
@@ -630,7 +633,8 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
         const content = readFileSync(existingPath('hooks', hook), 'utf-8')
         const lines = content.split('\n')
         const start = offset ? offset - 1 : 0
-        const sliced = limit ? lines.slice(start, start + limit) : lines.slice(start)
+        const end = start + (limit ?? DEFAULT_READ_LIMIT)
+        const sliced = lines.slice(start, end)
         return sliced.join('\n')
       } catch (e: any) {
         debug(`hook_read error: ${e.message}`)
