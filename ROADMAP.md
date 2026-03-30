@@ -2,6 +2,8 @@
 
 ## in progress
 
+- [x] add timezone parameter to evolve_datetime tool (default: UTC)
+
 ## done
 
 - [x] rename heartbeat_model to model in config for consistency with state

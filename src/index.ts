@@ -104,6 +104,19 @@ const LOG_PREFIX = '[evolve]'
 // observational hooks — failure should not trigger recover cascade
 const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification'])
 
+// --- datetime ---
+
+function formatDatetime(date: Date, timezone = 'UTC'): string {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    fractionalSecondDigits: 3, hour12: false, timeZoneName: 'longOffset',
+  })
+  const p = Object.fromEntries(fmt.formatToParts(date).map(v => [v.type, v.value]))
+  const offset = p.timeZoneName === 'GMT' ? '+00:00' : p.timeZoneName.replace('GMT', '')
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}.${p.fractionalSecond}${offset}`
+}
+
 // --- logging ---
 
 function debug(msg: string) {
@@ -413,7 +426,7 @@ async function performCleanup(client: any, sessionId: string, model: any): Promi
   }
 
   // rotate: create new session for 'new' or 'archive' actions
-  const newTitle = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
+  const newTitle = `${CONFIG.heartbeat_title} (${formatDatetime(new Date())})`
   const newId = await createSession(client, newTitle)
   debug(`heartbeat cleanup successful: action=${CONFIG.heartbeat_cleanup} old=${sessionId} new=${newId}`)
   return newId
@@ -485,10 +498,12 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
   // --- builtin tools (escape hatch — work even if hook is bricked) ---
 
   tools['evolve_datetime'] = tool({
-    description: `get the current date and time in UTC`,
-    args: {},
-    async execute() {
-      return new Date().toISOString()
+    description: `get the current date and time`,
+    args: {
+      timezone: tool.schema.string().describe('IANA timezone (e.g. America/New_York, Europe/London)').optional(),
+    },
+    async execute({ timezone }) {
+      return formatDatetime(new Date(), timezone || 'UTC')
     },
   })
 
@@ -751,7 +766,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         return
       }
       if (!heartbeatSessionId) {
-        const title = `${CONFIG.heartbeat_title} (${new Date().toISOString()})`
+        const title = `${CONFIG.heartbeat_title} (${formatDatetime(new Date())})`
         heartbeatSessionId = await createSession(client, title)
         persistRuntime({ heartbeat_session: heartbeatSessionId })
         debug(`heartbeat: session created id=${heartbeatSessionId}`)
@@ -786,7 +801,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         }
         debug('heartbeat: prompt sent')
         const count = (loadRuntime().heartbeat_count || 0) + 1
-        persistRuntime({ heartbeat_count: count, heartbeat_time: new Date().toISOString() })
+        persistRuntime({ heartbeat_count: count, heartbeat_time: formatDatetime(new Date()) })
       }
       if (result.modified?.length) trackModified(result.modified)
       if (result.notify?.length) await sendNotifications(client, result.notify, heartbeatSessionId!)
@@ -796,13 +811,13 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
     } finally {
       debug('heartbeat: tick finish')
       if (CONFIG.heartbeat_ms >= 0) {
-        debug(`heartbeat: next tick scheduled at ${new Date(Date.now() + CONFIG.heartbeat_ms).toISOString()}`)
+        debug(`heartbeat: next tick scheduled at ${formatDatetime(new Date(Date.now() + CONFIG.heartbeat_ms))}`)
         setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
       }
     }
   }
   if (CONFIG.heartbeat_ms >= 0) {
-    debug(`heartbeat: initial tick scheduled at ${new Date(Date.now() + CONFIG.heartbeat_ms).toISOString()}`)
+    debug(`heartbeat: initial tick scheduled at ${formatDatetime(new Date(Date.now() + CONFIG.heartbeat_ms))}`)
     setTimeout(heartbeatTick, CONFIG.heartbeat_ms)
   }
 
