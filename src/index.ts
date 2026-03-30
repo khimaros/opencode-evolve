@@ -195,10 +195,10 @@ async function commitWorkspace(message: string) {
 // run test suite against a candidate hook in an isolated temp workspace
 async function validateHook(hookContent: string): Promise<{ ok: boolean, output: string }> {
   if (!CONFIG.test_script) return { ok: true, output: 'no test_script configured' }
-  const testScript = path.join(WORKSPACE, CONFIG.test_script)
   const tmp = mkdtempSync(path.join(tmpdir(), 'evolve-validate-'))
   try {
     cpSync(WORKSPACE, tmp, { recursive: true })
+    const testScript = path.join(tmp, CONFIG.test_script)
     const hookPath = path.join(tmp, CONFIG.hook)
     writeFileSync(hookPath, hookContent)
     chmodSync(hookPath, 0o755)
