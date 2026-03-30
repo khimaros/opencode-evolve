@@ -319,23 +319,31 @@ async function createSession(client: any, title: string): Promise<string> {
 const sessionHistory = new Map<string, any[]>()
 const pendingMessagesQueue: any[][] = []
 
-// --- immutable system prompt + notification queues ---
+// --- immutable system prompt ---
 
 // frozen system prompt per-session (byte-identical on every LLM call)
 const sessionBasePrompt = new Map<string, string[]>()
-// structured notifications queued per-session, awaiting formatting
-const pendingNotifications = new Map<string, any[]>()
-// formatted message parts ready for injection on next messages.transform
-const injectOnNextTransform: any[][] = []
 
-// queue notifications to all sessions except the source
-function queueNotifications(notifications: any[], sourceSessionId?: string) {
-  for (const notification of notifications) {
-    for (const [sessionId] of sessionBasePrompt) {
-      if (sessionId === sourceSessionId) continue
-      const queue = pendingNotifications.get(sessionId) || []
-      queue.push(notification)
-      pendingNotifications.set(sessionId, queue)
+// send persistent notifications to all sessions except the source.
+// uses session.prompt({noReply}) so notifications survive restarts.
+async function sendNotifications(client: any, notifications: any[], sourceSessionId?: string) {
+  const formatted = await callHook('format_notification', { notifications })
+  if (!formatted.message) return
+  const wrapped = `<system-reminder>\n<assistant-notification>${formatted.message}</assistant-notification>\n</system-reminder>`
+  for (const [sessionId] of sessionBasePrompt) {
+    if (sessionId === sourceSessionId) continue
+    try {
+      await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          noReply: true,
+          agent: CONFIG.heartbeat_agent,
+          parts: [{ type: 'text', text: wrapped, synthetic: true }],
+        },
+      })
+      debug(`notification sent to session ${sessionId}`)
+    } catch (e: any) {
+      debug(`notification send failed for ${sessionId}: ${e.message}`)
     }
   }
 }
@@ -415,7 +423,7 @@ async function performCleanup(client: any, sessionId: string, model: any): Promi
 
 // build opencode tool registrations from hook-defined tool definitions
 // calls spawnHook directly to avoid recover cascade during init
-async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>> {
+async function discoverTools(client: any): Promise<Record<string, ReturnType<typeof tool>>> {
   if (!existsSync(HOOK_PATH)) {
     debug('hook discover skipped: hook not found')
     return {}
@@ -465,7 +473,7 @@ async function discoverTools(): Promise<Record<string, ReturnType<typeof tool>>>
           debug(`tool ${TOOL_PREFIX}_${def.name} execute session=${context.sessionID}`)
           const result = await callHook('execute_tool', { tool: def.name, args: toolArgs, session: { id: context.sessionID } }, context.sessionID)
           if (result.modified?.length) trackModified(result.modified)
-          if (result.notify?.length) queueNotifications(result.notify, context.sessionID)
+          if (result.notify?.length) await sendNotifications(client, result.notify, context.sessionID)
           await commitWorkspace(`update ${def.name}`)
           return result.result || 'done'
         } catch (e: any) {
@@ -716,7 +724,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   // WARNING: this only works if --port= is specified explicitly to `opencode serve`
   const client = createOpencodeClient({ baseUrl: serverUrl.toString(), directory: WORKSPACE })
 
-  const registeredTools = await discoverTools()
+  const registeredTools = await discoverTools(client)
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
 
   let heartbeatSessionId: string | null = loadRuntime().heartbeat_session || null
@@ -781,7 +789,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         persistRuntime({ heartbeat_count: count, heartbeat_time: new Date().toISOString() })
       }
       if (result.modified?.length) trackModified(result.modified)
-      if (result.notify?.length) queueNotifications(result.notify, heartbeatSessionId!)
+      if (result.notify?.length) await sendNotifications(client, result.notify, heartbeatSessionId!)
       if (result.actions?.length) await executeActions(client, result.actions)
     } catch (e: any) {
       debug(`heartbeat: tick failed: ${e.message}`)
@@ -816,7 +824,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
           answer,
         }, input.sessionID)
         if (result.modified?.length) trackModified(result.modified)
-        if (result.notify?.length) queueNotifications(result.notify, input.sessionID)
+        if (result.notify?.length) await sendNotifications(client, result.notify, input.sessionID)
         if (result.actions?.length) await executeActions(client, result.actions)
         // idle continuation: when LLM gives a final response (no tool calls),
         // ask the hook if the session should be forced to continue
@@ -866,14 +874,6 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
       pendingMessagesQueue.push((output.messages || []).map((m: any) => ({
         role: m.info?.role, agent: m.info?.agent, parts: m.parts,
       })))
-      // inject formatted notifications from previous round (global FIFO)
-      const toInject = injectOnNextTransform.shift()
-      if (toInject) {
-        for (const parts of toInject) {
-          output.messages.push({ parts, info: { role: 'user' } } as any)
-        }
-        debug(`injected ${toInject.length} notification(s) into messages`)
-      }
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -893,22 +893,6 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
           if (result.system?.length) {
             output.system.splice(0, output.system.length, ...result.system)
             sessionBasePrompt.set(input.sessionID, result.system)
-          }
-        }
-        // format pending notifications and queue for next messages.transform
-        const notifications = pendingNotifications.get(input.sessionID)
-        if (notifications?.length) {
-          pendingNotifications.delete(input.sessionID)
-          const formatted = await callHook('format_notification', {
-            session: { id: input.sessionID },
-            notifications,
-          }, input.sessionID)
-          if (formatted.message) {
-            const wrapped = `<internal-notification>\n${formatted.message}\n</internal-notification>`
-            injectOnNextTransform.push([
-              [{ type: 'text', text: wrapped, synthetic: true }],
-            ])
-            debug(`queued notification for ${input.sessionID}: ${formatted.message}`)
           }
         }
       } catch (e: any) {
