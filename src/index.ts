@@ -484,7 +484,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
   }
   // --- builtin tools (escape hatch — work even if hook is bricked) ---
 
-  tools[`${TOOL_PREFIX}_datetime`] = tool({
+  tools['evolve_datetime'] = tool({
     description: `get the current date and time in UTC`,
     args: {},
     async execute() {
@@ -492,7 +492,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_heartbeat_time`] = tool({
+  tools['evolve_heartbeat_time'] = tool({
     description: `get the last heartbeat runtime in UTC`,
     args: {},
     async execute() {
@@ -501,7 +501,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_prompt_list`] = tool({
+  tools['evolve_prompt_list'] = tool({
     description: `list prompt files in prompts/ (bare filenames like "chat.md")`,
     args: {},
     async execute() {
@@ -516,7 +516,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_prompt_read`] = tool({
+  tools['evolve_prompt_read'] = tool({
     description: `read an existing prompt file from prompts/ (must already exist)`,
     args: {
       prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
@@ -538,7 +538,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_prompt_write`] = tool({
+  tools['evolve_prompt_write'] = tool({
     description: `overwrite an existing prompt file in prompts/ (cannot create new files)`,
     args: {
       prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
@@ -560,7 +560,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_prompt_edit`] = tool({
+  tools['evolve_prompt_edit'] = tool({
     description: `edit an existing prompt file in prompts/ (find-and-replace, cannot create new files)`,
     args: {
       prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
@@ -587,7 +587,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_hook_list`] = tool({
+  tools['evolve_hook_list'] = tool({
     description: `list hook files in hooks/ (bare filenames like "persona.py")`,
     args: {},
     async execute() {
@@ -602,7 +602,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_hook_read`] = tool({
+  tools['evolve_hook_read'] = tool({
     description: `read an existing hook file from hooks/ (must already exist)`,
     args: {
       hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
@@ -624,7 +624,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_hook_write`] = tool({
+  tools['evolve_hook_write'] = tool({
     description: `overwrite an existing hook file in hooks/ (validated before install if it is the configured hook, cannot create new files)`,
     args: {
       hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
@@ -651,7 +651,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_hook_edit`] = tool({
+  tools['evolve_hook_edit'] = tool({
     description: `edit an existing hook file in hooks/ (find-and-replace, validated before install if it is the configured hook, cannot create new files)`,
     args: {
       hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
@@ -683,7 +683,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
-  tools[`${TOOL_PREFIX}_hook_validate`] = tool({
+  tools['evolve_hook_validate'] = tool({
     description: `validate hook content against the test suite without installing it`,
     args: {
       content: tool.schema.string().describe('full content for the hook to validate'),
