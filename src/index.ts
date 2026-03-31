@@ -129,8 +129,9 @@ async function validateHook(hookFilePath: string, hookContent: string): Promise<
     debug(`validateHook: testScript=${tmpTest} hookPath=${tmpHook}`)
     writeFileSync(tmpHook, hookContent)
     chmodSync(tmpHook, 0o755)
+    chmodSync(tmpTest, 0o755)
     const { ok, output } = await new Promise<{ ok: boolean, output: string }>((resolve) => {
-      const proc = spawn('python3', [tmpTest], {
+      const proc = spawn(tmpTest, [], {
         env: { ...process.env, OPENCODE_EVOLVE_WORKSPACE: tmp },
         stdio: ['pipe', 'pipe', 'pipe'],
       })
