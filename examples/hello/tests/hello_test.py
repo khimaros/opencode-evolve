@@ -79,6 +79,8 @@ try:
     r, logs, _ = call_hook(hook, "discover")
     check("discover returns tools key", has_key(r, "tools"))
     check("discover has no typo keys", not has_key(r, "tool"))
+    check("discover returns name", r.get("name") == "evolve", f"got: {r.get('name')}")
+    check("discover returns test", r.get("test") == "hello_test.py", f"got: {r.get('test')}")
     names = [t["name"] for t in r["tools"]]
     for expected in ("note_list", "note_read", "note_write", "note_delete"):
         check(f"discover includes {expected}", expected in names, f"got: {names}")

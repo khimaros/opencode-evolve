@@ -2,6 +2,10 @@
 
 ## in progress
 
+- [x] composable multi-hook support (autodiscovery, registration via discover, serial merge)
+
+## done
+
 - [x] add timezone parameter to evolve_datetime tool (default: UTC)
 
 ## done

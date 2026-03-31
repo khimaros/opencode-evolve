@@ -119,7 +119,7 @@ def tool_defs():
 def discover(ctx: dict) -> HookResult:
     names = [t["name"] for t in tool_defs()]
     debug(f"tools: {', '.join(names)}")
-    return {"tools": tool_defs()}
+    return {"name": "evolve", "test": "hello_test.py", "tools": tool_defs()}
 
 @hook
 def mutate_request(ctx: dict) -> HookResult:

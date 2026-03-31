@@ -7,117 +7,28 @@ import { homedir } from 'os'
 import path from 'node:path'
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, cpSync, chmodSync, mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { type EvolveConfig, type HookRegistration, loadConfig } from './config.js'
+import { editContent } from './edit.js'
+import { parseHookOutput, mergeResults } from './hook.js'
+import { formatDatetime } from './datetime.js'
+import { safePath, existingPath, discoverHookPaths } from './path.js'
 
 const execFileAsync = promisify(execFile)
 
 const DEFAULT_READ_LIMIT = 2000
 
-// --- config ---
-
-interface EvolveConfig {
-  hook: string
-  heartbeat_ms: number
-  hook_timeout: number
-  heartbeat_title: string
-  heartbeat_agent: string
-  test_script: string | null
-  model: { providerID: string; modelID: string } | null
-  heartbeat_cleanup: 'none' | 'new' | 'archive' | 'compact'
-  heartbeat_cleanup_count: number | null
-  heartbeat_cleanup_tokens: number | null
-}
-
-const DEFAULTS: EvolveConfig = {
-  hook: 'hooks/evolve.py',
-  heartbeat_ms: 120 * 60 * 1000,
-  hook_timeout: 30_000,
-  heartbeat_title: 'heartbeat',
-  heartbeat_agent: 'evolve',
-  test_script: null,
-  model: null,
-  heartbeat_cleanup: 'none',
-  heartbeat_cleanup_count: null,
-  heartbeat_cleanup_tokens: null,
-}
-
-// coerce env string to match the type of the existing config value
-function coerceEnv(val: string, existing: any): any {
-  if (existing === null || typeof existing === 'string') return val === 'null' ? null : val
-  if (typeof existing === 'number') return val === 'null' ? null : Number(val)
-  return val
-}
-
-// apply EVOLVE_<FIELD> env vars to config (e.g. EVOLVE_HEARTBEAT_MS -> heartbeat_ms)
-function applyEnvOverrides(config: any) {
-  for (const field of Object.keys(DEFAULTS)) {
-    const val = process.env[`EVOLVE_${field.toUpperCase()}`]
-    if (val !== undefined) config[field] = coerceEnv(val, DEFAULTS[field as keyof EvolveConfig])
-  }
-}
-
-function normalizeModel(config: any) {
-  if (typeof config.model === 'string' && config.model.includes('/')) {
-    const [providerID, ...rest] = config.model.split('/')
-    config.model = { providerID, modelID: rest.join('/') }
-  }
-}
-
-function loadConfig(workspace: string): EvolveConfig {
-  const configPath = path.join(workspace, 'config', 'evolve.jsonc')
-  let parsed: any
-  try {
-    const raw = readFileSync(configPath, 'utf-8')
-    // strip jsonc comments (// and /* */)
-    const json = raw.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')
-    parsed = { ...DEFAULTS, ...JSON.parse(json) }
-  } catch {
-    parsed = { ...DEFAULTS }
-  }
-  applyEnvOverrides(parsed)
-  normalizeModel(parsed)
-  return parsed
-}
-
-// resolve a filename within a workspace subdirectory, rejecting traversal
-function safePath(dir: string, filename: string): string {
-  const base = path.join(WORKSPACE, dir)
-  const resolved = path.resolve(base, filename)
-  if (!resolved.startsWith(base + path.sep) && resolved !== base) {
-    throw new Error(`invalid ${dir} path: ${filename}`)
-  }
-  return resolved
-}
-
-// require that a file already exists (no implicit creation)
-function existingPath(dir: string, filename: string): string {
-  const resolved = safePath(dir, filename)
-  if (!existsSync(resolved)) throw new Error(`not found: ${dir}/${filename}`)
-  return resolved
-}
-
 // --- state ---
 
 const WORKSPACE = process.env.OPENCODE_EVOLVE_WORKSPACE || process.env.OPENCODE_SIDECAR_WORKSPACE || path.join(homedir(), 'workspace')
 const CONFIG = loadConfig(WORKSPACE)
-const HOOK_PATH = path.join(WORKSPACE, CONFIG.hook)
 const STATE_PATH = path.join(WORKSPACE, 'state', 'evolve.json')
-const TOOL_PREFIX = path.parse(CONFIG.hook).name
 const LOG_PREFIX = '[evolve]'
 // observational hooks — failure should not trigger recover cascade
 const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification'])
 
-// --- datetime ---
-
-function formatDatetime(date: Date, timezone = 'UTC'): string {
-  const fmt = new Intl.DateTimeFormat('en-CA', {
-    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    fractionalSecondDigits: 3, hour12: false, timeZoneName: 'longOffset',
-  })
-  const p = Object.fromEntries(fmt.formatToParts(date).map(v => [v.type, v.value]))
-  const offset = p.timeZoneName === 'GMT' ? '+00:00' : p.timeZoneName.replace('GMT', '')
-  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}.${p.fractionalSecond}${offset}`
-}
+const HOOK_PATHS = discoverHookPaths(WORKSPACE)
+// populated during init by registerHooks()
+const hookRegistrations = new Map<string, HookRegistration>()
 
 // --- logging ---
 
@@ -170,9 +81,9 @@ async function ensureGitRepo() {
   if (gitReady) return
   await gitExec('init')
   try { await gitExec('config', 'user.email') }
-  catch { await gitExec('config', 'user.email', TOOL_PREFIX) }
+  catch { await gitExec('config', 'user.email', 'evolve') }
   try { await gitExec('config', 'user.name') }
-  catch { await gitExec('config', 'user.name', TOOL_PREFIX) }
+  catch { await gitExec('config', 'user.name', 'evolve') }
   gitReady = true
 }
 
@@ -192,20 +103,32 @@ async function commitWorkspace(message: string) {
 
 // --- hook validation ---
 
+// look up registration for a hook file by its absolute path
+function registrationForHook(hookFilePath: string): HookRegistration | undefined {
+  const abs = path.resolve(hookFilePath)
+  for (const reg of hookRegistrations.values()) {
+    if (path.resolve(reg.path) === abs) return reg
+  }
+  return undefined
+}
+
 // run test suite against a candidate hook in an isolated temp workspace
-async function validateHook(hookContent: string): Promise<{ ok: boolean, output: string }> {
-  if (!CONFIG.test_script) return { ok: true, output: 'no test_script configured' }
+async function validateHook(hookFilePath: string, hookContent: string): Promise<{ ok: boolean, output: string }> {
+  const reg = registrationForHook(hookFilePath)
+  if (!reg?.test) return { ok: true, output: 'no test registered' }
+  const testScript = path.join('tests', reg.test)
+  const hookRelative = path.relative(WORKSPACE, hookFilePath)
   const tmp = mkdtempSync(path.join(tmpdir(), 'evolve-validate-'))
   debug(`validateHook: workspace=${WORKSPACE} tmp=${tmp}`)
   try {
     cpSync(WORKSPACE, tmp, { recursive: true })
-    const testScript = path.join(tmp, CONFIG.test_script)
-    const hookPath = path.join(tmp, CONFIG.hook)
-    debug(`validateHook: testScript=${testScript} hookPath=${hookPath}`)
-    writeFileSync(hookPath, hookContent)
-    chmodSync(hookPath, 0o755)
+    const tmpTest = path.join(tmp, testScript)
+    const tmpHook = path.join(tmp, hookRelative)
+    debug(`validateHook: testScript=${tmpTest} hookPath=${tmpHook}`)
+    writeFileSync(tmpHook, hookContent)
+    chmodSync(tmpHook, 0o755)
     const { ok, output } = await new Promise<{ ok: boolean, output: string }>((resolve) => {
-      const proc = spawn('python3', [testScript], {
+      const proc = spawn('python3', [tmpTest], {
         env: { ...process.env, OPENCODE_EVOLVE_WORKSPACE: tmp },
         stdio: ['pipe', 'pipe', 'pipe'],
       })
@@ -226,21 +149,13 @@ async function validateHook(hookContent: string): Promise<{ ok: boolean, output:
   }
 }
 
-// find-and-replace with optional replaceAll support
-function editContent(content: string, oldString: string, newString: string, replaceAll = false): string | { error: string } {
-  const n = content.split(oldString).length - 1
-  if (n === 0) return { error: 'oldString not found' }
-  if (n > 1 && !replaceAll) return { error: `${n} matches for oldString, expected 1 (use replaceAll to replace all)` }
-  return replaceAll ? content.replaceAll(oldString, newString) : content.replace(oldString, newString)
-}
-
 // --- hook IPC ---
 
 // spawn hook subprocess with explicit stdin pipe and manual timeout
 // (Bun's execFile doesn't pipe input; spawn ignores the timeout option)
-function spawnHook(name: string, input: string): Promise<{ stdout: string }> {
+function spawnHook(hookPath: string, name: string, input: string): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(HOOK_PATH, [name], { cwd: WORKSPACE, stdio: ['pipe', 'pipe', 'inherit'] })
+    const proc = spawn(hookPath, [name], { cwd: WORKSPACE, stdio: ['pipe', 'pipe', 'inherit'] })
     let stdout = '', done = false
     const timer = setTimeout(() => {
       if (!done) { proc.kill(); reject(new Error('timeout')) }
@@ -256,46 +171,51 @@ function spawnHook(name: string, input: string): Promise<{ stdout: string }> {
   })
 }
 
-// parse JSONL stdout: merge all lines into one result, log any {log} lines
-function parseHookOutput(name: string, stdout: string): any {
-  const result: any = {}
-  for (const line of stdout.split('\n')) {
-    if (!line.trim()) continue
-    const obj = JSON.parse(line)
-    if (obj.log) { debug(obj.log); continue }
-    Object.assign(result, obj)
-  }
-  return result
-}
 
-async function callHook(name: string, context: object, sessionId?: string): Promise<any> {
-  if (!existsSync(HOOK_PATH)) {
-    debug(`hook ${name} skipped: hook not found`)
-    return {}
-  }
+// call a single hook file by path
+async function callSingleHook(hookPath: string, name: string, context: object, sessionId?: string): Promise<any> {
+  const stem = path.parse(hookPath).name
   const start = Date.now()
   try {
     const history = sessionId ? sessionHistory.get(sessionId) || [] : undefined
     const input = JSON.stringify({ hook: name, ...context, ...(history ? { history } : {}) })
-    debug(`hook ${name} start`)
-    const { stdout } = await spawnHook(name, input)
+    debug(`hook ${name} [${stem}] start`)
+    const { stdout } = await spawnHook(hookPath, name, input)
     const ms = Date.now() - start
-    if (!stdout.trim()) { debug(`hook ${name} empty (${ms}ms)`); return {} }
-    const result = parseHookOutput(name, stdout)
+    if (!stdout.trim()) { debug(`hook ${name} [${stem}] empty (${ms}ms)`); return {} }
+    const result = parseHookOutput(stdout, debug)
     const keys = Object.keys(result).join(', ')
-    if (result.error) debug(`hook ${name} error: ${result.error} (${ms}ms)`)
-    else debug(`hook ${name} ok [${keys}] (${ms}ms)`)
+    if (result.error) debug(`hook ${name} [${stem}] error: ${result.error} (${ms}ms)`)
+    else debug(`hook ${name} [${stem}] ok [${keys}] (${ms}ms)`)
     return result
   } catch (e: any) {
     const ms = Date.now() - start
-    debug(`hook ${name} failed (${ms}ms): ${e.message}`)
-    if (e.code != null) debug(`hook ${name} exit code: ${e.code}`)
-    if (e.signal) debug(`hook ${name} signal: ${e.signal}`)
-    if (name !== 'recover' && !NO_RECOVER_HOOKS.has(name)) {
-      return callHook('recover', { error: e.message, failed_hook: name })
-    }
+    debug(`hook ${name} [${stem}] failed (${ms}ms): ${e.message}`)
+    if (e.code != null) debug(`hook ${name} [${stem}] exit code: ${e.code}`)
+    if (e.signal) debug(`hook ${name} [${stem}] signal: ${e.signal}`)
+    throw e
+  }
+}
+
+// call all hooks serially (alphabetical), merging results. recover per failed hook.
+async function callHook(name: string, context: object, sessionId?: string): Promise<any> {
+  if (HOOK_PATHS.length === 0) {
+    debug(`hook ${name} skipped: no hooks found`)
     return {}
   }
+  let merged: any = {}
+  for (const hookPath of HOOK_PATHS) {
+    try {
+      const result = await callSingleHook(hookPath, name, context, sessionId)
+      merged = mergeResults(merged, result)
+    } catch (e: any) {
+      if (name !== 'recover' && !NO_RECOVER_HOOKS.has(name)) {
+        const recovery = await callHook('recover', { error: e.message, failed_hook: name })
+        merged = mergeResults(merged, recovery)
+      }
+    }
+  }
+  return merged
 }
 
 // --- actions ---
@@ -438,68 +358,80 @@ async function performCleanup(client: any, sessionId: string, model: any): Promi
 
 // --- plugin ---
 
-// build opencode tool registrations from hook-defined tool definitions
-// calls spawnHook directly to avoid recover cascade during init
-async function discoverTools(client: any): Promise<Record<string, ReturnType<typeof tool>>> {
-  if (!existsSync(HOOK_PATH)) {
-    debug('hook discover skipped: hook not found')
-    return {}
-  }
-  let discovered: any = {}
+// register a single hook: call discover, store registration, return tool defs
+async function registerHook(hookPath: string): Promise<{ prefix: string, tools: any[] }> {
+  const stem = path.parse(hookPath).name
   const start = Date.now()
+  let discovered: any = {}
   try {
     const input = JSON.stringify({ hook: 'discover' })
-    debug('hook discover start')
-    const { stdout } = await spawnHook('discover', input)
+    debug(`hook discover [${stem}] start`)
+    const { stdout } = await spawnHook(hookPath, 'discover', input)
     const ms = Date.now() - start
-    if (stdout.trim()) discovered = parseHookOutput('discover', stdout)
-    debug(`hook discover ok (${ms}ms)`)
+    if (stdout.trim()) discovered = parseHookOutput(stdout, debug)
+    debug(`hook discover [${stem}] ok (${ms}ms)`)
   } catch (e: any) {
     const ms = Date.now() - start
-    debug(`hook discover failed (${ms}ms): ${e.message}`)
-    return {}
+    debug(`hook discover [${stem}] failed (${ms}ms): ${e.message}`)
   }
-  const tools: Record<string, ReturnType<typeof tool>> = {}
-  for (const def of discovered.tools || []) {
-    const args: Record<string, any> = {}
-    for (const [param, spec] of Object.entries(def.parameters || {})) {
-      // backwards compat: bare string = string type with that description
-      if (typeof spec === 'string') {
-        args[param] = tool.schema.string().describe(spec)
-        continue
-      }
-      const { type, description, optional } = spec as { type?: string, description?: string, optional?: boolean }
-      const desc = description || param
-      const SCHEMA_TYPES: Record<string, () => any> = {
-        string: () => tool.schema.string().describe(desc),
-        number: () => tool.schema.number().describe(desc),
-        boolean: () => tool.schema.boolean().describe(desc),
-        object: () => tool.schema.record(tool.schema.string(), tool.schema.any()).describe(desc),
-        array: () => tool.schema.array(tool.schema.any()).describe(desc),
-        any: () => tool.schema.any().describe(desc),
-      }
-      let schema = (SCHEMA_TYPES[type || 'string'] || SCHEMA_TYPES.string)()
-      if (optional) schema = schema.optional()
-      args[param] = schema
+  const hookName = discovered.name || stem
+  const reg: HookRegistration = { path: hookPath, name: hookName, test: discovered.test || null }
+  hookRegistrations.set(hookName, reg)
+  return { prefix: hookName, tools: discovered.tools || [] }
+}
+
+// build tool schema args from a hook tool definition
+function buildToolArgs(def: any): Record<string, any> {
+  const args: Record<string, any> = {}
+  for (const [param, spec] of Object.entries(def.parameters || {})) {
+    if (typeof spec === 'string') {
+      args[param] = tool.schema.string().describe(spec)
+      continue
     }
-    tools[`${TOOL_PREFIX}_${def.name}`] = tool({
-      description: def.description,
-      args,
-      async execute(toolArgs, context) {
-        try {
-          debug(`tool ${TOOL_PREFIX}_${def.name} execute session=${context.sessionID}`)
-          const result = await callHook('execute_tool', { tool: def.name, args: toolArgs, session: { id: context.sessionID } }, context.sessionID)
-          if (result.modified?.length) trackModified(result.modified)
-          if (result.notify?.length) await sendNotifications(client, result.notify, context.sessionID)
-          await commitWorkspace(`update ${def.name}`)
-          return result.result || 'done'
-        } catch (e: any) {
-          return `tool error: ${e.message}`
-        }
-      },
-    })
+    const { type, description, optional } = spec as { type?: string, description?: string, optional?: boolean }
+    const desc = description || param
+    const SCHEMA_TYPES: Record<string, () => any> = {
+      string: () => tool.schema.string().describe(desc),
+      number: () => tool.schema.number().describe(desc),
+      boolean: () => tool.schema.boolean().describe(desc),
+      object: () => tool.schema.record(tool.schema.string(), tool.schema.any()).describe(desc),
+      array: () => tool.schema.array(tool.schema.any()).describe(desc),
+      any: () => tool.schema.any().describe(desc),
+    }
+    let schema = (SCHEMA_TYPES[type || 'string'] || SCHEMA_TYPES.string)()
+    if (optional) schema = schema.optional()
+    args[param] = schema
   }
-  // --- builtin tools (escape hatch — work even if hook is bricked) ---
+  return args
+}
+
+// register all hooks and build opencode tool registrations
+async function discoverTools(client: any): Promise<Record<string, ReturnType<typeof tool>>> {
+  const tools: Record<string, ReturnType<typeof tool>> = {}
+  for (const hookPath of HOOK_PATHS) {
+    const { prefix, tools: defs } = await registerHook(hookPath)
+    for (const def of defs) {
+      const fullName = `${prefix}_${def.name}`
+      tools[fullName] = tool({
+        description: def.description,
+        args: buildToolArgs(def),
+        async execute(toolArgs, context) {
+          try {
+            debug(`tool ${fullName} execute session=${context.sessionID}`)
+            const result = await callSingleHook(hookPath, 'execute_tool', { tool: def.name, args: toolArgs, session: { id: context.sessionID } }, context.sessionID)
+            if (result.modified?.length) trackModified(result.modified)
+            if (result.notify?.length) await sendNotifications(client, result.notify, context.sessionID)
+            await commitWorkspace(`update ${def.name}`)
+            return result.result || 'done'
+          } catch (e: any) {
+            return `tool error: ${e.message}`
+          }
+        },
+      })
+    }
+  }
+
+  // --- builtin tools (escape hatch — work even if hooks are bricked) ---
 
   tools['evolve_datetime'] = tool({
     description: `get the current date and time`,
@@ -545,7 +477,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     async execute({ prompt, offset, limit }) {
       debug(`prompt_read: ${prompt}`)
       try {
-        const content = readFileSync(existingPath('prompts', prompt), 'utf-8')
+        const content = readFileSync(existingPath(WORKSPACE, 'prompts', prompt), 'utf-8')
         const lines = content.split('\n')
         const start = offset ? offset - 1 : 0
         const end = start + (limit ?? DEFAULT_READ_LIMIT)
@@ -567,8 +499,8 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     async execute({ prompt, content }) {
       debug(`prompt_write: ${prompt}`)
       try {
-        existingPath('prompts', prompt)
-        writeFileSync(safePath('prompts', prompt), content)
+        existingPath(WORKSPACE, 'prompts', prompt)
+        writeFileSync(safePath(WORKSPACE, 'prompts', prompt), content)
         trackModified([`prompts/${prompt}`])
         await commitWorkspace(`write prompt ${prompt}`)
         debug(`prompt_write ok: ${prompt}`)
@@ -591,7 +523,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     async execute({ prompt, oldString, newString, replaceAll }) {
       debug(`prompt_edit: ${prompt}`)
       try {
-        const filePath = existingPath('prompts', prompt)
+        const filePath = existingPath(WORKSPACE, 'prompts', prompt)
         const content = readFileSync(filePath, 'utf-8')
         const result = editContent(content, oldString, newString, replaceAll)
         if (typeof result !== 'string') { debug(`prompt_edit failed: ${result.error}`); return `failed: ${result.error}` }
@@ -613,7 +545,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     async execute() {
       debug('hook_list')
       try {
-        const files = readdirSync(path.join(WORKSPACE, 'hooks')).sort()
+        const files = HOOK_PATHS.map(p => path.basename(p))
         return `available hooks: ${files.join(', ')}`
       } catch (e: any) {
         debug(`hook_list error: ${e.message}`)
@@ -632,7 +564,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     async execute({ hook, offset, limit }) {
       debug(`hook_read: ${hook}`)
       try {
-        const content = readFileSync(existingPath('hooks', hook), 'utf-8')
+        const content = readFileSync(existingPath(WORKSPACE, 'hooks', hook), 'utf-8')
         const lines = content.split('\n')
         const start = offset ? offset - 1 : 0
         const end = start + (limit ?? DEFAULT_READ_LIMIT)
@@ -646,7 +578,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
   })
 
   tools['evolve_hook_write'] = tool({
-    description: `overwrite an existing hook file in hooks/ (validated before install if it is the configured hook, cannot create new files)`,
+    description: `overwrite an existing hook file in hooks/ (validated against registered test before install, cannot create new files)`,
     args: {
       hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
       content: tool.schema.string().describe('full content for the hook'),
@@ -654,10 +586,10 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     async execute({ hook, content }) {
       debug(`hook_write: ${hook}`)
       try {
-        const filePath = existingPath('hooks', hook)
-        const isConfiguredHook = path.resolve(filePath) === path.resolve(HOOK_PATH)
-        if (isConfiguredHook) {
-          const validation = await validateHook(content)
+        const filePath = existingPath(WORKSPACE, 'hooks', hook)
+        const reg = registrationForHook(filePath)
+        if (reg?.test) {
+          const validation = await validateHook(filePath, content)
           if (!validation.ok) { debug('hook_write: validation failed'); return `validation failed:\n${validation.output}` }
         }
         writeFileSync(filePath, content)
@@ -673,7 +605,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
   })
 
   tools['evolve_hook_edit'] = tool({
-    description: `edit an existing hook file in hooks/ (find-and-replace, validated before install if it is the configured hook, cannot create new files)`,
+    description: `edit an existing hook file in hooks/ (find-and-replace, validated against registered test before install, cannot create new files)`,
     args: {
       hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
       oldString: tool.schema.string().describe('the text to replace'),
@@ -683,13 +615,13 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     async execute({ hook, oldString, newString, replaceAll }) {
       debug(`hook_edit: ${hook}`)
       try {
-        const filePath = existingPath('hooks', hook)
+        const filePath = existingPath(WORKSPACE, 'hooks', hook)
         const content = readFileSync(filePath, 'utf-8')
         const result = editContent(content, oldString, newString, replaceAll)
         if (typeof result !== 'string') { debug(`hook_edit failed: ${result.error}`); return `failed: ${result.error}` }
-        const isConfiguredHook = path.resolve(filePath) === path.resolve(HOOK_PATH)
-        if (isConfiguredHook) {
-          const validation = await validateHook(result)
+        const reg = registrationForHook(filePath)
+        if (reg?.test) {
+          const validation = await validateHook(filePath, result)
           if (!validation.ok) { debug('hook_edit: validation failed'); return `validation failed:\n${validation.output}` }
         }
         writeFileSync(filePath, result)
@@ -705,14 +637,16 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
   })
 
   tools['evolve_hook_validate'] = tool({
-    description: `validate hook content against the test suite without installing it`,
+    description: `validate hook content against its registered test suite without installing it`,
     args: {
+      hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
       content: tool.schema.string().describe('full content for the hook to validate'),
     },
-    async execute({ content }) {
-      debug('hook_validate')
+    async execute({ hook, content }) {
+      debug(`hook_validate: ${hook}`)
       try {
-        const validation = await validateHook(content)
+        const filePath = existingPath(WORKSPACE, 'hooks', hook)
+        const validation = await validateHook(filePath, content)
         if (validation.ok) { debug('hook_validate: passed'); return `validation passed` }
         debug('hook_validate: failed')
         return `validation failed:\n${validation.output}`
@@ -734,7 +668,7 @@ function trackModified(_files: string[]) {
 export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, serverUrl }) => {
   debug(`evolve initialized in ${directory}`)
   debug(`workspace: ${WORKSPACE}`)
-  debug(`hook: ${CONFIG.hook} (prefix: ${TOOL_PREFIX})`)
+  debug(`hooks: ${HOOK_PATHS.map(p => path.basename(p)).join(', ') || '(none)'}`)
   if (CONFIG.heartbeat_ms < 0) debug('heartbeat: disabled (heartbeat_ms < 0)')
 
   // ensure git repo exists before creating client so the server resolves

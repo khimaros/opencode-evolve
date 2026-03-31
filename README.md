@@ -25,9 +25,12 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
 ├── state/
 │   └── evolve.json         # runtime state (auto-managed)
 ├── hooks/
-│   └── evolve.py           # hook script
+│   ├── persona.py          # hook scripts (autodiscovered)
+│   └── logger.py
 ├── prompts/                # prompt templates
-└── tests/                  # hook validation tests
+└── tests/
+    ├── persona_test.py     # per-hook test scripts
+    └── logger_test.py
 ```
 
 ## configuration
@@ -36,7 +39,6 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
 
 ```jsonc
 {
-  "hook": "hooks/evolve.py",      // hook script path (workspace-relative)
   "model": null,                   // "provider/model" or { providerID, modelID } (auto-detected if omitted)
   "heartbeat_ms": 1800000,        // heartbeat interval (30 min)
   "hook_timeout": 30000,          // subprocess timeout (30s)
@@ -44,12 +46,11 @@ set `OPENCODE_EVOLVE_WORKSPACE` to your workspace directory (default: `~/workspa
   "heartbeat_agent": "evolve",    // agent ID for heartbeat prompts
   "heartbeat_cleanup": "none",     // "none" | "new" | "archive" | "compact"
   "heartbeat_cleanup_count": null, // cleanup after N heartbeats (null = disabled)
-  "heartbeat_cleanup_tokens": null,// cleanup after N total tokens (null = disabled)
-  "test_script": null              // path to test script for hook validation
+  "heartbeat_cleanup_tokens": null // cleanup after N total tokens (null = disabled)
 }
 ```
 
-env var overrides: `EVOLVE_MODEL`, `EVOLVE_HOOK`, `EVOLVE_HEARTBEAT_AGENT`. env vars always take precedence over config file values.
+env var overrides: `EVOLVE_MODEL`, `EVOLVE_HEARTBEAT_AGENT`. env vars always take precedence over config file values.
 
 `heartbeat_cleanup` defines what happens when a threshold is reached:
 - `none`: thresholds are ignored; heartbeat accumulates indefinitely in one session.
@@ -73,7 +74,7 @@ with a corresponding agent file at `agents/evolve.md`.
 
 ## hook protocol
 
-the plugin calls your hook script as a subprocess:
+all executable files in `hooks/` are autodiscovered and called as subprocesses (alphabetical order, files starting with `.` or `__` are ignored):
 
 ```
 $WORKSPACE/hooks/<hook> <hook_name>
@@ -87,11 +88,18 @@ $WORKSPACE/hooks/<hook> <hook_name>
 
 **exit code**: 0 = success, non-zero = failure (triggers `recover` hook unless the failing hook is observational).
 
+### composability
+
+multiple hooks run serially in alphabetical order. results are merged across all hooks:
+- **arrays** (`system`, `tools`, `notifications`, `actions`, `modified`) are concatenated
+- **scalars** (`continue`, `prompt`, `user`, `message`, `result`) are concatenated with newline
+- **errors** trigger `recover` per failed hook; other hooks continue regardless
+
 ### hooks
 
 #### `discover`
 
-called once at plugin init. return tool definitions.
+called once at plugin init. return registration metadata and tool definitions.
 
 input:
 ```json
@@ -100,8 +108,12 @@ input:
 
 output:
 ```json
-{"tools": [{"name": "my_tool", "description": "...", "parameters": {"arg": "description"}}]}
+{"name": "persona", "test": "persona_test.py", "tools": [{"name": "my_tool", "description": "...", "parameters": {"arg": "description"}}]}
 ```
+
+registration fields (optional):
+- **name** — tool prefix and hook identifier (defaults to filename stem). tools are registered as `<name>_<tool_name>`.
+- **test** — test script filename in `tests/` for hook validation (e.g. `persona_test.py`). if omitted, no validation is performed on hook writes.
 
 parameters support two formats:
 
@@ -244,13 +256,13 @@ input (after):
 
 the plugin provides builtin tools that let agents modify their own behavior at runtime:
 
-- **hook editing** — `hook_list`, `hook_read`, `hook_write`, `hook_edit` let the agent modify existing hook files. writes to the configured hook are validated against `test_script` before installation. new hooks cannot be created or deleted.
+- **hook editing** — `hook_list`, `hook_read`, `hook_write`, `hook_edit` let the agent modify existing hook files. writes are validated against the hook's registered test script before installation. new hooks cannot be created or deleted.
 - **prompt editing** — `prompt_list`, `prompt_read`, `prompt_write`, `prompt_edit` let the agent modify existing prompt templates. new prompts cannot be created or deleted.
-- **tool discovery** — custom tools defined by the hook's `discover` response are automatically registered with opencode.
+- **tool discovery** — custom tools defined by each hook's `discover` response are automatically registered with opencode.
 
 ## tool discovery
 
-tools are defined by the hook's `discover` response. each tool gets a prefixed name derived from the `hook` config path's filename stem. for example, with the default `hooks/evolve.py`, a tool named `my_tool` becomes `evolve_my_tool`.
+tools are defined by each hook's `discover` response. each tool gets a prefixed name derived from the hook's registered `name` (or filename stem if not specified). for example, a hook returning `{"name": "persona"}` with a tool named `trait_read` registers as `persona_trait_read`.
 
 ### builtin tools
 
@@ -307,7 +319,7 @@ def hook(fn):
 
 @hook
 def discover(ctx):
-    return {"tools": []}
+    return {"name": "mybot", "test": "mybot_test.py", "tools": []}
 
 @hook
 def mutate_request(ctx):
