@@ -347,6 +347,27 @@ if err:
 else:
     check("discoverHookPaths: returns empty for missing dir", result == [], f"got={result}")
 
+# --- permission: permissionPatterns ---
+
+result, err = run_node("""
+import { permissionPatterns } from './dist/permission.js';
+console.log(JSON.stringify([
+  { desc: 'no permission field', got: permissionPatterns({}, {}) },
+  { desc: 'permission with arg string', got: permissionPatterns({ permission: { arg: 'trait' } }, { trait: 'SOUL.md' }) },
+  { desc: 'permission with arg missing from args', got: permissionPatterns({ permission: { arg: 'trait' } }, {}) },
+  { desc: 'permission with arg array', got: permissionPatterns({ permission: { arg: ['old_trait', 'new_trait'] } }, { old_trait: 'a.md', new_trait: 'b.md' }) },
+  { desc: 'permission with arg array partial', got: permissionPatterns({ permission: { arg: ['old_trait', 'new_trait'] } }, { old_trait: 'a.md' }) },
+]));
+""")
+if err:
+    check("permissionPatterns: run", False, err)
+else:
+    check("permissionPatterns: no permission field", result[0]['got'] == ['*'], f"got={result[0]['got']}")
+    check("permissionPatterns: arg string", result[1]['got'] == ['SOUL.md'], f"got={result[1]['got']}")
+    check("permissionPatterns: arg missing", result[2]['got'] == ['*'], f"got={result[2]['got']}")
+    check("permissionPatterns: arg array", result[3]['got'] == ['a.md', 'b.md'], f"got={result[3]['got']}")
+    check("permissionPatterns: arg array partial", result[4]['got'] == ['a.md'], f"got={result[4]['got']}")
+
 # --- summary ---
 
 print(f"\n{PASS + FAIL} tests, {PASS} passed, {FAIL} failed")

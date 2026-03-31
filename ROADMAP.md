@@ -2,6 +2,7 @@
 
 ## in progress
 
+- [x] fine-grained permissions for builtin tools (hook_write, hook_edit) and hook-defined tools via context.ask()
 - [x] composable multi-hook support (autodiscovery, registration via discover, serial merge)
 
 ## done

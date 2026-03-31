@@ -122,6 +122,42 @@ parameters support two formats:
 
 supported types: `string`, `number`, `boolean`, `object`, `array`, `any`
 
+#### tool permissions
+
+tools can declare a `permission` field in their discover definition to enable fine-grained permission control via opencode's agent config. the `permission.arg` field specifies which tool argument(s) to use as the permission pattern:
+
+```json
+{"name": "trait_write", "description": "...", "parameters": {...}, "permission": {"arg": "trait"}}
+{"name": "trait_move", "description": "...", "parameters": {...}, "permission": {"arg": ["old_trait", "new_trait"]}}
+```
+
+tools without a `permission` field default to `patterns: ["*"]` and can only be controlled with simple allow/deny.
+
+agent config examples:
+
+```yaml
+permission:
+  # simple allow/deny all invocations
+  persona_trait_delete: "deny"
+  persona_note_list: "allow"
+
+  # fine-grained by pattern (requires permission.arg in tool definition)
+  persona_trait_write:
+    "SOUL.md": "deny"
+    "*": "allow"
+  persona_data_update:
+    ".people.json": "deny"
+    "*": "allow"
+
+  # restrict which hooks can be edited
+  evolve_hook_write:
+    "persona.py": "allow"
+    "*": "deny"
+  evolve_hook_edit:
+    "persona.py": "allow"
+    "*": "deny"
+```
+
 #### `mutate_request`
 
 called on each new session to generate the system prompt. return `{"system": [...]}` to manage the session, or `{}` to skip. the result is cached per-session (system prompt is frozen after first call).

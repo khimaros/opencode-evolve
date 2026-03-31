@@ -12,6 +12,7 @@ import { editContent } from './edit.js'
 import { parseHookOutput, mergeResults } from './hook.js'
 import { formatDatetime } from './datetime.js'
 import { safePath, existingPath, discoverHookPaths } from './path.js'
+import { permissionPatterns } from './permission.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -422,6 +423,8 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
         args: buildToolArgs(def),
         async execute(toolArgs, context) {
           try {
+            const patterns = permissionPatterns(def, toolArgs)
+            await context.ask({ permission: fullName, patterns, always: patterns, metadata: {} })
             debug(`tool ${fullName} execute session=${context.sessionID}`)
             const result = await callSingleHook(hookPath, 'execute_tool', { tool: def.name, args: toolArgs, session: { id: context.sessionID } }, context.sessionID)
             if (result.modified?.length) trackModified(result.modified)
@@ -588,9 +591,10 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
       hook: tool.schema.string().describe('hook filename in hooks/ (e.g. "persona.py")'),
       content: tool.schema.string().describe('full content for the hook'),
     },
-    async execute({ hook, content }) {
+    async execute({ hook, content }, context) {
       debug(`hook_write: ${hook}`)
       try {
+        await context.ask({ permission: 'evolve_hook_write', patterns: [hook], always: [hook], metadata: {} })
         const filePath = existingPath(WORKSPACE, 'hooks', hook)
         const reg = registrationForHook(filePath)
         if (reg?.test) {
@@ -618,9 +622,10 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
       newString: tool.schema.string().describe('the text to replace it with (must be different from oldString)'),
       replaceAll: tool.schema.boolean().optional().describe('replace all occurrences (default false)'),
     },
-    async execute({ hook, oldString, newString, replaceAll }) {
+    async execute({ hook, oldString, newString, replaceAll }, context) {
       debug(`hook_edit: ${hook}`)
       try {
+        await context.ask({ permission: 'evolve_hook_edit', patterns: [hook], always: [hook], metadata: {} })
         const filePath = existingPath(WORKSPACE, 'hooks', hook)
         const content = readFileSync(filePath, 'utf-8')
         const result = editContent(content, oldString, newString, replaceAll)

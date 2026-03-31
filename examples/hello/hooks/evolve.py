@@ -28,9 +28,15 @@ def hook(fn):
     HOOKS[fn.__name__] = fn
     return fn
 
-def tool(fn):
-    TOOLS[fn.__name__] = fn
-    return fn
+def tool(fn=None, *, permission=None):
+    def decorator(f):
+        if permission:
+            f._permission = permission
+        TOOLS[f.__name__] = f
+        return f
+    if fn is not None:
+        return decorator(fn)
+    return decorator
 
 def debug(msg):
     print(json.dumps({"log": msg}), flush=True)
@@ -63,7 +69,7 @@ def note_list() -> HookResult:
     names = note_names()
     return {"result": f"notes: {', '.join(names)}" if names else "no notes yet"}
 
-@tool
+@tool(permission={"arg": "name"})
 def note_read(
     name: Annotated[str, "note filename (e.g. todo.md)"],
 ) -> HookResult:
@@ -74,7 +80,7 @@ def note_read(
         return {"result": f"not found: {name}"}
     return {"result": content}
 
-@tool
+@tool(permission={"arg": "name"})
 def note_write(
     name: Annotated[str, "note filename (e.g. todo.md)"],
     content: Annotated[str, "full content for the note"],
@@ -85,7 +91,7 @@ def note_write(
     return {"result": f"wrote {name}", "modified": [name],
             "notify": [{"type": "note_changed", "files": [name]}]}
 
-@tool
+@tool(permission={"arg": "name"})
 def note_delete(
     name: Annotated[str, "note filename (e.g. todo.md)"],
 ) -> HookResult:
@@ -108,9 +114,10 @@ def tool_defs():
             for p, h in hints.items()
             if p != "return" and hasattr(h, "__metadata__")
         }
-        defs.append(
-            {"name": name, "description": fn.__doc__ or "", "parameters": params}
-        )
+        entry = {"name": name, "description": fn.__doc__ or "", "parameters": params}
+        if hasattr(fn, "_permission"):
+            entry["permission"] = fn._permission
+        defs.append(entry)
     return defs
 
 # --- hooks ---
