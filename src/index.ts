@@ -29,6 +29,8 @@ const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message'
 const HOOK_PATHS = discoverHookPaths(WORKSPACE)
 // populated during init by registerHooks()
 const hookRegistrations = new Map<string, HookRegistration>()
+// tool definitions per hook name, refreshed on re-discovery
+const hookToolDefs = new Map<string, any[]>()
 
 // --- logging ---
 
@@ -377,7 +379,9 @@ async function registerHook(hookPath: string): Promise<{ prefix: string, tools: 
   const hookName = discovered.name || stem
   const reg: HookRegistration = { path: hookPath, name: hookName, test: discovered.test || null }
   hookRegistrations.set(hookName, reg)
-  return { prefix: hookName, tools: discovered.tools || [] }
+  const defs = discovered.tools || []
+  hookToolDefs.set(hookName, defs)
+  return { prefix: hookName, tools: defs }
 }
 
 // build tool schema args from a hook tool definition
@@ -595,6 +599,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
         writeFileSync(filePath, content)
         chmodSync(filePath, 0o755)
         await commitWorkspace(`write hook ${hook}`)
+        await registerHook(filePath)
         debug(`hook_write ok: ${hook}`)
         return `successfully wrote ${hook}`
       } catch (e: any) {
@@ -627,6 +632,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
         writeFileSync(filePath, result)
         chmodSync(filePath, 0o755)
         await commitWorkspace(`edit hook ${hook}`)
+        await registerHook(filePath)
         debug(`hook_edit ok: ${hook}`)
         return `successfully edited ${hook}`
       } catch (e: any) {
@@ -654,6 +660,57 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
         debug(`hook_validate error: ${e.message}`)
         return `error: ${e.message}`
       }
+    },
+  })
+
+  tools['evolve_tool_list'] = tool({
+    description: `list all registered hook tools with descriptions and parameters`,
+    args: {},
+    async execute() {
+      debug('tool_list')
+      const lines: string[] = []
+      for (const [hookName, reg] of hookRegistrations.entries()) {
+        const defs = hookToolDefs.get(hookName) || []
+        for (const def of defs) {
+          const params = Object.entries(def.parameters || {}).map(([k, v]: [string, any]) => {
+            const desc = typeof v === 'string' ? v : v.description || k
+            return `${k}: ${desc}`
+          }).join(', ')
+          lines.push(`  ${hookName}_${def.name}(${params}): ${def.description}`)
+        }
+      }
+      return `available tools:\n${lines.join('\n')}`
+    },
+  })
+
+  tools['evolve_tool_invoke'] = tool({
+    description: `invoke a hook tool dynamically by name (prefix_toolname format)`,
+    args: {
+      name: tool.schema.string().describe('full tool name (e.g. "persona_trait_list")'),
+      args: tool.schema.record(tool.schema.string(), tool.schema.any()).describe('tool arguments').optional(),
+    },
+    async execute({ name, args: toolArgs }, context) {
+      debug(`tool_invoke: ${name}`)
+      // parse prefix_toolname to find the hook
+      for (const [hookName, reg] of hookRegistrations.entries()) {
+        const prefix = `${hookName}_`
+        if (!name.startsWith(prefix)) continue
+        const toolName = name.slice(prefix.length)
+        const defs = hookToolDefs.get(hookName) || []
+        if (!defs.some((d: any) => d.name === toolName)) {
+          return `unknown tool: ${name} (hook ${hookName} has no tool ${toolName})`
+        }
+        try {
+          const result = await callSingleHook(reg.path, 'execute_tool', { tool: toolName, args: toolArgs || {}, session: { id: context.sessionID } }, context.sessionID)
+          if (result.modified?.length) trackModified(result.modified)
+          if (result.notify?.length) await sendNotifications(client, result.notify, context.sessionID)
+          await commitWorkspace(`update ${toolName}`)
+          return result.result || 'done'
+        } catch (e: any) {
+          return `tool error: ${e.message}`
+        }
+      }
+      return `unknown tool: ${name}`
     },
   })
 
