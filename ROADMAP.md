@@ -2,15 +2,13 @@
 
 ## in progress
 
-- [x] fine-grained permissions for builtin tools (hook_write, hook_edit) and hook-defined tools via context.ask()
-- [x] composable multi-hook support (autodiscovery, registration via discover, serial merge)
-
 ## done
 
 - [x] add timezone parameter to evolve_datetime tool (default: UTC)
-
-## done
-
+- [x] log full tool call results (especially errors) instead of 200-char truncated preview
+- [x] missing/unhandled hooks should not produce error logs or trigger recovery
+- [x] fine-grained permissions for builtin tools (hook_write, hook_edit) and hook-defined tools
+- [x] composable multi-hook support (autodiscovery, registration via discover, serial merge)
 - [x] rename heartbeat_model to model in config for consistency with state
 - [x] env var overrides for config (EVOLVE_* prefix)
 - [x] builtin tool to get last heartbeat runtime in UTC

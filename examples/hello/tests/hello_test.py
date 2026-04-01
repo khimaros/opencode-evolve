@@ -69,7 +69,7 @@ try:
     # --- error handling ---
 
     r, _, rc = call_hook(hook, "nonexistent")
-    check("unknown hook returns error", has_key(r, "error"))
+    check("unknown hook exits cleanly", rc == 0 and r == {})
 
     proc = subprocess.run([hook], capture_output=True, text=True)
     check("no args returns error", proc.returncode != 0 or "error" in proc.stdout)
@@ -306,6 +306,12 @@ try:
         "session": {"id": "h3"}, "tool": "t", "callID": "c", "title": "", "output": "", "history": sample_history,
     })
     check("tool_after with history ok", not has_key(r, "error"))
+
+    # --- unknown hook: should exit 0 with no output ---
+
+    r, logs, code = call_hook(hook, "nonexistent_hook", {})
+    check("unknown hook exits 0", code == 0, f"exit_code={code}")
+    check("unknown hook returns empty result", r == {}, f"got={r}")
 
 finally:
     shutil.rmtree(tmp)

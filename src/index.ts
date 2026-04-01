@@ -9,7 +9,7 @@ import { readFileSync, readdirSync, writeFileSync, mkdirSync, cpSync, chmodSync,
 import { tmpdir } from 'node:os'
 import { type EvolveConfig, type HookRegistration, loadConfig } from './config.js'
 import { editContent } from './edit.js'
-import { parseHookOutput, mergeResults } from './hook.js'
+import { parseHookOutput, mergeResults, toolOutputPreview } from './hook.js'
 import { formatDatetime } from './datetime.js'
 import { safePath, existingPath, discoverHookPaths } from './path.js'
 import { permissionPatterns } from './permission.js'
@@ -25,7 +25,7 @@ const CONFIG = loadConfig(WORKSPACE)
 const STATE_PATH = path.join(WORKSPACE, 'state', 'evolve.json')
 const LOG_PREFIX = '[evolve]'
 // observational hooks — failure should not trigger recover cascade
-const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification'])
+const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification', 'idle', 'compacting'])
 
 const HOOK_PATHS = discoverHookPaths(WORKSPACE)
 // populated during init by registerHooks()
@@ -878,7 +878,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
     },
 
     "tool.execute.after": async (input, output) => {
-      const preview = output.output?.length > 200 ? output.output.slice(0, 200) + '...' : output.output
+      const preview = toolOutputPreview(output.output)
       debug(`tool done: ${input.tool} session=${input.sessionID} call=${input.callID} output=${preview}`)
       await callHook('tool_after', {
         session: { id: input.sessionID },

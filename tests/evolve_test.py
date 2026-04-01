@@ -224,6 +224,34 @@ else:
     check("mergeResults: empty base", result[5]['got'] == {'a': 1}, f"got={result[5]['got']}")
     check("mergeResults: empty incoming", result[6]['got'] == {'a': 1}, f"got={result[6]['got']}")
 
+# --- hook: toolOutputPreview ---
+
+result, err = run_node("""
+import { toolOutputPreview } from './dist/hook.js';
+const long = 'x'.repeat(300);
+const errorShort = 'Error: something broke';
+const errorLong = 'Error: ' + 'x'.repeat(500);
+console.log(JSON.stringify([
+  { desc: 'undefined', got: toolOutputPreview(undefined) },
+  { desc: 'empty string', got: toolOutputPreview('') },
+  { desc: 'short output', got: toolOutputPreview('hello world') },
+  { desc: 'long output truncated', got: toolOutputPreview(long), len: toolOutputPreview(long).length },
+  { desc: 'short error full', got: toolOutputPreview(errorShort) },
+  { desc: 'long error full', got: toolOutputPreview(errorLong), len: toolOutputPreview(errorLong).length },
+  { desc: 'custom limit', got: toolOutputPreview('abcdefghij', 5), len: toolOutputPreview('abcdefghij', 5).length },
+]));
+""")
+if err:
+    check("toolOutputPreview: run", False, err)
+else:
+    check("toolOutputPreview: undefined returns empty", result[0]['got'] == '', f"got={result[0]['got']!r}")
+    check("toolOutputPreview: empty string", result[1]['got'] == '', f"got={result[1]['got']!r}")
+    check("toolOutputPreview: short output unchanged", result[2]['got'] == 'hello world', f"got={result[2]['got']!r}")
+    check("toolOutputPreview: long output truncated", result[3]['len'] == 203, f"len={result[3]['len']}")
+    check("toolOutputPreview: short error shown in full", result[4]['got'] == 'Error: something broke', f"got={result[4]['got']!r}")
+    check("toolOutputPreview: long error shown in full", result[5]['len'] == 507, f"len={result[5]['len']}")
+    check("toolOutputPreview: custom limit", result[6]['len'] == 8, f"len={result[6]['len']}")
+
 # --- datetime: formatDatetime ---
 
 result, err = run_node("""

@@ -10,6 +10,17 @@ export function parseHookOutput(stdout: string, logFn?: (msg: string) => void): 
   return result
 }
 
+const DEFAULT_OUTPUT_LIMIT = 200
+
+// build a log-friendly preview of tool output, showing errors in full
+export function toolOutputPreview(output: string | undefined, limit = DEFAULT_OUTPUT_LIMIT): string {
+  if (!output) return ''
+  const looksLikeError = /\berror\b/i.test(output.slice(0, 200))
+  if (looksLikeError) return output
+  if (output.length <= limit) return output
+  return output.slice(0, limit) + '...'
+}
+
 // merge two hook results: arrays concatenate, scalars concatenate with newline
 export function mergeResults(base: any, incoming: any): any {
   const merged = { ...base }

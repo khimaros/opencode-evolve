@@ -215,8 +215,7 @@ if __name__ == "__main__":
         sys.exit(1)
     h = HOOKS.get(sys.argv[1])
     if not h:
-        print(json.dumps({"error": f"unknown hook: {sys.argv[1]}"}))
-        sys.exit(1)
+        sys.exit(0)
     try:
         ctx = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
