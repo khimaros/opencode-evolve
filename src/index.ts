@@ -386,6 +386,33 @@ async function registerHook(hookPath: string): Promise<{ prefix: string, tools: 
   return { prefix: hookName, tools: defs }
 }
 
+// parse py-style type annotations into zod schemas
+// supports: string, number, boolean, any, object, array,
+//           array[T], object[K, V] where T/K/V are base types
+function parseTypeSchema(type: string, desc: string): any {
+  const match = type.match(/^(\w+)(?:\[(.+)\])?$/)
+  const base = match?.[1] || 'string'
+  const inner = match?.[2]?.split(',').map(s => s.trim())
+
+  const BASE: Record<string, (d?: string) => any> = {
+    string: (d) => d ? tool.schema.string().describe(d) : tool.schema.string(),
+    number: (d) => d ? tool.schema.number().describe(d) : tool.schema.number(),
+    boolean: (d) => d ? tool.schema.boolean().describe(d) : tool.schema.boolean(),
+    any: (d) => d ? tool.schema.any().describe(d) : tool.schema.any(),
+    object: (d) => d ? tool.schema.record(tool.schema.string(), tool.schema.any()).describe(d) : tool.schema.record(tool.schema.string(), tool.schema.any()),
+    array: (d) => d ? tool.schema.array(tool.schema.any()).describe(d) : tool.schema.array(tool.schema.any()),
+  }
+  const resolve = (t: string, d?: string) => (BASE[t] || BASE.any)(d)
+
+  if (base === 'array' && inner?.length) {
+    return tool.schema.array(resolve(inner[0])).describe(desc)
+  }
+  if (base === 'object' && inner?.length === 2) {
+    return tool.schema.record(resolve(inner[0]), resolve(inner[1])).describe(desc)
+  }
+  return resolve(base, desc)
+}
+
 // build tool schema args from a hook tool definition
 function buildToolArgs(def: any): Record<string, any> {
   const args: Record<string, any> = {}
@@ -396,15 +423,8 @@ function buildToolArgs(def: any): Record<string, any> {
     }
     const { type, description, optional } = spec as { type?: string, description?: string, optional?: boolean }
     const desc = description || param
-    const SCHEMA_TYPES: Record<string, () => any> = {
-      string: () => tool.schema.string().describe(desc),
-      number: () => tool.schema.number().describe(desc),
-      boolean: () => tool.schema.boolean().describe(desc),
-      object: () => tool.schema.record(tool.schema.string(), tool.schema.any()).describe(desc),
-      array: () => tool.schema.array(tool.schema.any()).describe(desc),
-      any: () => tool.schema.any().describe(desc),
-    }
-    let schema = (SCHEMA_TYPES[type || 'string'] || SCHEMA_TYPES.string)()
+    // parse type annotations: string, array[string], object[string, number], etc.
+    let schema = parseTypeSchema(type || 'string', desc)
     if (optional) schema = schema.optional()
     args[param] = schema
   }
