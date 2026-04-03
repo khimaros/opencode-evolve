@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { createOpencodeClient } from "@opencode-ai/sdk"
+import { createOpencodeClient } from "@opencode-ai/sdk/client"
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { homedir } from 'os'
