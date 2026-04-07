@@ -394,13 +394,25 @@ function parseTypeSchema(type: string, desc: string): any {
   const base = match?.[1] || 'string'
   const inner = match?.[2]?.split(',').map(s => s.trim())
 
+  // jsonValue: explicit union of primitives + nested arrays/objects.
+  // gives providers a concrete shape signal so they don't wrap scalars
+  // in single-key objects to satisfy an under-specified `any` schema.
+  const jsonValue: any = tool.schema.lazy(() => tool.schema.union([
+    tool.schema.string(),
+    tool.schema.number(),
+    tool.schema.boolean(),
+    tool.schema.null(),
+    tool.schema.array(jsonValue),
+    tool.schema.record(tool.schema.string(), jsonValue),
+  ]))
+
   const BASE: Record<string, (d?: string) => any> = {
     string: (d) => d ? tool.schema.string().describe(d) : tool.schema.string(),
     number: (d) => d ? tool.schema.number().describe(d) : tool.schema.number(),
     boolean: (d) => d ? tool.schema.boolean().describe(d) : tool.schema.boolean(),
-    any: (d) => d ? tool.schema.any().describe(d) : tool.schema.any(),
-    object: (d) => d ? tool.schema.record(tool.schema.string(), tool.schema.any()).describe(d) : tool.schema.record(tool.schema.string(), tool.schema.any()),
-    array: (d) => d ? tool.schema.array(tool.schema.any()).describe(d) : tool.schema.array(tool.schema.any()),
+    any: (d) => d ? jsonValue.describe(d) : jsonValue,
+    object: (d) => d ? tool.schema.record(tool.schema.string(), jsonValue).describe(d) : tool.schema.record(tool.schema.string(), jsonValue),
+    array: (d) => d ? tool.schema.array(jsonValue).describe(d) : tool.schema.array(jsonValue),
   }
   const resolve = (t: string, d?: string) => (BASE[t] || BASE.any)(d)
 
