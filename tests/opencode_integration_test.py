@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""end-to-end test: capture the actual LLM request opencode sends when the
+evolve plugin is loaded, via a mock openai-compatible server.
+
+strategy:
+  1. build the plugin (dist/index.js)
+  2. spawn a local http server impersonating an openai chat-completions endpoint
+  3. write an opencode.json in a temp workspace that:
+       - defines a custom provider (npm defaults to @ai-sdk/openai-compatible)
+         whose baseURL points at our mock server
+       - registers dist/index.js as a plugin
+       - selects mock/mock as both model and small_model
+  4. run `opencode run "hello"` against that workspace
+  5. assert the captured request body contains a real system prompt and the
+     evolve_* tool schemas
+  6. dump the full captured payload to tests/.artifacts/ for inspection
+"""
+
+import json, os, shlex, shutil, socket, subprocess, sys, tempfile, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ARTIFACTS = PROJECT_ROOT / "tests" / ".artifacts"
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
+
+# opencode binary selection:
+#   OPENCODE_BIN=<command>   full command override (space-separated, shlex-parsed)
+#   OPENCODE_SRC=<path>      local opencode checkout; runs via `bun run <src>/packages/opencode/src/index.ts`
+#   (default)                `opencode` from PATH
+def resolve_opencode_cmd():
+    override = os.environ.get("OPENCODE_BIN")
+    if override:
+        return shlex.split(override)
+    src = os.environ.get("OPENCODE_SRC")
+    if src:
+        entry = Path(src) / "packages" / "opencode" / "src" / "index.ts"
+        if not entry.exists():
+            print(f"OPENCODE_SRC set but entry point not found: {entry}", file=sys.stderr)
+            sys.exit(2)
+        return ["bun", "run", "--conditions=browser", str(entry)]
+    return ["opencode"]
+
+OPENCODE_CMD = resolve_opencode_cmd()
+print(f"opencode command: {' '.join(OPENCODE_CMD)}")
+
+PASS = FAIL = 0
+
+def check(desc, ok, detail=""):
+    global PASS, FAIL
+    if ok:
+        PASS += 1
+        print(f"PASS: {desc}")
+    else:
+        FAIL += 1
+        print(f"FAIL: {desc}")
+        if detail:
+            print(f"  {detail}")
+
+# --- mock openai-compatible server ---
+
+captured = []
+capture_lock = threading.Lock()
+
+SSE_RESPONSE = (
+    'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
+    '"choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
+    'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
+    '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+    '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+    'data: [DONE]\n\n'
+).encode()
+
+class MockHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"_raw": raw.decode("utf-8", "replace")}
+        with capture_lock:
+            captured.append({"path": self.path, "headers": dict(self.headers), "body": body})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(SSE_RESPONSE)
+
+    def do_GET(self):
+        # some providers probe /models; return empty list
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"object":"list","data":[]}')
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+def start_mock():
+    port = free_port()
+    server = HTTPServer(("127.0.0.1", port), MockHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, port
+
+# --- build plugin ---
+
+print("building plugin...")
+r = subprocess.run(["npx", "tsc"], cwd=PROJECT_ROOT, capture_output=True, text=True)
+if r.returncode != 0:
+    print("FAIL: build")
+    print(r.stdout); print(r.stderr)
+    sys.exit(1)
+plugin_path = PROJECT_ROOT / "dist" / "index.js"
+check("plugin built", plugin_path.exists(), f"missing: {plugin_path}")
+
+# --- set up workspace ---
+
+workdir = Path(tempfile.mkdtemp(prefix="evolve-llm-test-"))
+evolve_workspace = workdir / "workspace"
+project_dir = workdir / "project"
+project_dir.mkdir()
+
+# seed the evolve workspace from the hello example so its hook is autodiscovered
+# and exposes @tool-annotated functions with typed/optional Annotated params.
+# this lets us verify hook-defined tools flow all the way through to the LLM
+# request with correct JSON schemas.
+hello_src = PROJECT_ROOT / "examples" / "hello"
+shutil.copytree(hello_src, evolve_workspace)
+# ensure hook is executable after copy
+hook_file = evolve_workspace / "hooks" / "evolve.py"
+hook_file.chmod(0o755)
+
+server, port = start_mock()
+base_url = f"http://127.0.0.1:{port}/v1"
+print(f"mock server on {base_url}")
+
+config = {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {
+        "mock": {
+            "name": "Mock",
+            "options": {"apiKey": "test", "baseURL": base_url},
+            "models": {"mock": {"name": "Mock Model"}},
+        }
+    },
+    "model": "mock/mock",
+    "small_model": "mock/mock",
+    "plugin": [plugin_path.as_uri()],
+}
+(project_dir / "opencode.json").write_text(json.dumps(config, indent=2))
+
+env = {
+    **os.environ,
+    "OPENCODE_EVOLVE_WORKSPACE": str(evolve_workspace),
+    "OPENAI_API_KEY": "test",
+    # avoid opencode trying to autoupdate / share
+    "CI": "1",
+}
+
+# --- run opencode ---
+
+print("running opencode...")
+proc = subprocess.Popen(
+    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "hello world"],
+    cwd=str(project_dir),
+    env=env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+
+# wait up to 90s for a chat-completions request that carries tools
+# (opencode will also fire title-generation and possibly other calls with
+# no tools — we want the real build-agent request)
+deadline = time.time() + 90
+chat_req = None
+while time.time() < deadline:
+    with capture_lock:
+        for c in captured:
+            if "chat/completions" not in c["path"]:
+                continue
+            if c["body"].get("tools"):
+                chat_req = c
+                break
+    if chat_req:
+        break
+    if proc.poll() is not None:
+        # give pending requests a moment to flush
+        time.sleep(0.5)
+        with capture_lock:
+            for c in captured:
+                if "chat/completions" in c["path"] and c["body"].get("tools"):
+                    chat_req = c
+                    break
+        break
+    time.sleep(0.2)
+
+if proc.poll() is None:
+    proc.terminate()
+try:
+    stdout, stderr = proc.communicate(timeout=30)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    stdout, stderr = proc.communicate()
+
+(ARTIFACTS / "opencode.stdout.log").write_text(stdout or "")
+(ARTIFACTS / "opencode.stderr.log").write_text(stderr or "")
+
+server.shutdown()
+
+check("chat/completions request captured", chat_req is not None,
+      f"captured paths: {[c['path'] for c in captured]}")
+
+if not chat_req:
+    shutil.rmtree(workdir, ignore_errors=True)
+    print(f"\n{PASS} passed, {FAIL} failed")
+    sys.exit(1 if FAIL else 0)
+
+# --- dump artifact ---
+
+(ARTIFACTS / "llm_request.json").write_text(json.dumps(chat_req, indent=2, default=str))
+print(f"captured request dumped to {ARTIFACTS / 'llm_request.json'}")
+
+body = chat_req["body"]
+
+# --- assertions on system prompt ---
+
+messages = body.get("messages", [])
+system_msgs = [m for m in messages if m.get("role") == "system"]
+check("has system message(s)", len(system_msgs) > 0, f"messages: {[m.get('role') for m in messages]}")
+
+system_text = "\n".join(
+    (m["content"] if isinstance(m.get("content"), str)
+     else "".join(p.get("text", "") for p in (m.get("content") or []) if isinstance(p, dict)))
+    for m in system_msgs
+)
+check("system prompt non-empty", len(system_text) > 100, f"len={len(system_text)}")
+check("system prompt mentions environment", "<env>" in system_text or "environment" in system_text.lower())
+# hello's mutate_request fully replaces the system prompt with its own preamble,
+# so we check for the hello hook's contribution rather than opencode's env block
+check("system prompt from hello hook present", "note-taking assistant" in system_text,
+      f"got: {system_text[:200]}")
+
+# --- assertions on tools ---
+
+tools = body.get("tools", [])
+check("tools array present", isinstance(tools, list) and len(tools) > 0, f"got: {type(tools).__name__} len={len(tools) if isinstance(tools, list) else 'n/a'}")
+
+tool_names = []
+for t in tools if isinstance(tools, list) else []:
+    # openai format: {"type":"function","function":{"name":...,"parameters":...}}
+    fn = t.get("function") if isinstance(t, dict) else None
+    if fn and "name" in fn:
+        tool_names.append(fn["name"])
+
+check("tool names parsed", len(tool_names) > 0, f"tools[0]={tools[0] if tools else None}")
+
+expected_evolve_tools = {
+    "evolve_datetime",
+    "evolve_prompt_list",
+    "evolve_hook_list",
+}
+present = expected_evolve_tools & set(tool_names)
+check(f"builtin evolve tools present ({sorted(expected_evolve_tools)})",
+      present == expected_evolve_tools,
+      f"found: {sorted(present)}; all tools: {sorted(tool_names)}")
+
+# every tool should have a parameters schema
+missing_schema = [n for n in tool_names if not any(
+    (t.get("function", {}).get("name") == n and t.get("function", {}).get("parameters"))
+    for t in tools
+)]
+check("all tools have parameters schema", not missing_schema, f"missing: {missing_schema}")
+
+# --- assertions on hook-defined tools from examples/hello ---
+# hook prefix is "evolve" (from discover), so note_* → hello_note_*
+
+expected_hello_tools = {
+    "hello_note_list",
+    "hello_note_read",
+    "hello_note_write",
+    "hello_note_delete",
+}
+present_hello = expected_hello_tools & set(tool_names)
+check(f"hello hook tools present ({sorted(expected_hello_tools)})",
+      present_hello == expected_hello_tools,
+      f"found: {sorted(present_hello)}")
+
+def tool_params(name):
+    for t in tools:
+        fn = t.get("function", {})
+        if fn.get("name") == name:
+            return fn.get("parameters", {})
+    return {}
+
+def prop(name, field):
+    return (tool_params(name).get("properties") or {}).get(field) or {}
+
+def required(name):
+    return set(tool_params(name).get("required") or [])
+
+# hello_note_list: include_hidden: boolean, optional
+p = prop("hello_note_list", "include_hidden")
+check("note_list.include_hidden is boolean", p.get("type") == "boolean", f"got: {p}")
+check("note_list.include_hidden has description", "hidden" in (p.get("description") or "").lower())
+check("note_list.include_hidden is optional (not in required)",
+      "include_hidden" not in required("hello_note_list"),
+      f"required: {required('hello_note_list')}")
+
+# hello_note_read: name: string required, limit: number optional
+p = prop("hello_note_read", "name")
+check("note_read.name is string", p.get("type") == "string", f"got: {p}")
+check("note_read.name is required", "name" in required("hello_note_read"))
+p = prop("hello_note_read", "limit")
+check("note_read.limit is number", p.get("type") == "number", f"got: {p}")
+check("note_read.limit is optional", "limit" not in required("hello_note_read"))
+
+# hello_note_write: name+content required strings, tags: array[string] optional, metadata: object optional
+p = prop("hello_note_write", "tags")
+check("note_write.tags is array", p.get("type") == "array", f"got: {p}")
+items_type = (p.get("items") or {}).get("type")
+check("note_write.tags items are string", items_type == "string", f"got items: {p.get('items')}")
+check("note_write.tags is optional", "tags" not in required("hello_note_write"))
+
+p = prop("hello_note_write", "metadata")
+check("note_write.metadata is object", p.get("type") == "object", f"got: {p}")
+check("note_write.metadata is optional", "metadata" not in required("hello_note_write"))
+
+# verify commit fa5b1d7 ("more precise zod schema for nested objects"):
+# object/array/any params must expose the explicit jsonValue primitive union
+# (string|number|boolean|null|array|object) rather than an under-specified `any`.
+def resolve_schema(node, full_schema):
+    """follow a single $ref if present, returning the resolved object"""
+    if isinstance(node, dict) and "$ref" in node:
+        ref = node["$ref"]
+        if ref.startswith("#/$defs/"):
+            key = ref.split("/")[-1]
+            return (full_schema.get("$defs") or {}).get(key, {})
+    return node
+
+def has_primitive_union(node, full_schema):
+    """true if node (possibly via $ref) is an anyOf containing >=4 primitives"""
+    node = resolve_schema(node, full_schema)
+    if not isinstance(node, dict):
+        return False
+    variants = node.get("anyOf") or node.get("oneOf") or []
+    types = {v.get("type") for v in variants if isinstance(v, dict)}
+    # require at least string+number+boolean+null to prove it's the jsonValue union
+    return {"string", "number", "boolean", "null"}.issubset(types)
+
+write_schema = tool_params("hello_note_write")
+
+# object without inner types → additionalProperties must resolve to jsonValue union
+metadata_node = (write_schema.get("properties") or {}).get("metadata") or {}
+addl = metadata_node.get("additionalProperties")
+check("note_write.metadata values are jsonValue union (not bare any)",
+      addl is not None and has_primitive_union(addl, write_schema),
+      f"got additionalProperties: {addl}")
+
+# any type → schema must itself resolve to the jsonValue union
+p_extras = (write_schema.get("properties") or {}).get("extras") or {}
+check("note_write.extras (type=any) is jsonValue union",
+      has_primitive_union(p_extras, write_schema),
+      f"got: {p_extras}")
+
+# bare array (no inner type) → items must resolve to jsonValue union
+p_raw = (write_schema.get("properties") or {}).get("raw_list") or {}
+check("note_write.raw_list is array", p_raw.get("type") == "array", f"got: {p_raw}")
+items_node = p_raw.get("items")
+check("note_write.raw_list items are jsonValue union (not bare any)",
+      items_node is not None and has_primitive_union(items_node, write_schema),
+      f"got items: {items_node}")
+
+req_write = required("hello_note_write")
+check("note_write.name required", "name" in req_write)
+check("note_write.content required", "content" in req_write)
+for opt_field in ("tags", "metadata", "extras", "raw_list"):
+    check(f"note_write.{opt_field} is optional",
+          opt_field not in req_write, f"required: {req_write}")
+
+# hello_note_delete: name required string
+p = prop("hello_note_delete", "name")
+check("note_delete.name is string", p.get("type") == "string", f"got: {p}")
+check("note_delete.name is required", "name" in required("hello_note_delete"))
+
+# --- cleanup ---
+
+shutil.rmtree(workdir, ignore_errors=True)
+
+# --- hard-fail: every tool parameter must carry a description ---
+# zod `.describe()` → JSON schema `description` must survive all the way into
+# the outgoing request, otherwise the LLM sees nameless/untyped knobs.
+missing_param_desc = []
+for t in tools:
+    tname = t["function"]["name"]
+    props = (t["function"].get("parameters", {}).get("properties") or {})
+    for pname, pspec in props.items():
+        if not (isinstance(pspec, dict) and pspec.get("description")):
+            missing_param_desc.append(f"{tname}.{pname}")
+check("every tool parameter has a description",
+      not missing_param_desc,
+      f"missing descriptions on {len(missing_param_desc)} params: {missing_param_desc[:10]}"
+      + (f" ... (+{len(missing_param_desc)-10} more)" if len(missing_param_desc) > 10 else ""))
+
+print(f"\n{PASS} passed, {FAIL} failed")
+sys.exit(1 if FAIL else 0)

@@ -79,7 +79,7 @@ try:
     r, logs, _ = call_hook(hook, "discover")
     check("discover returns tools key", has_key(r, "tools"))
     check("discover has no typo keys", not has_key(r, "tool"))
-    check("discover returns name", r.get("name") == "evolve", f"got: {r.get('name')}")
+    check("discover returns name", r.get("name") == "hello", f"got: {r.get('name')}")
     check("discover returns test", r.get("test") == "hello_test.py", f"got: {r.get('test')}")
     names = [t["name"] for t in r["tools"]]
     for expected in ("note_list", "note_read", "note_write", "note_delete"):
@@ -90,7 +90,7 @@ try:
     # --- discover tool parameter schemas ---
 
     tools_by_name = {t["name"]: t for t in r["tools"]}
-    expected_counts = {"note_list": 0, "note_read": 1, "note_write": 2, "note_delete": 1}
+    expected_counts = {"note_list": 1, "note_read": 2, "note_write": 6, "note_delete": 1}
     for name, count in expected_counts.items():
         actual = len(tools_by_name[name]["parameters"])
         check(f"{name} has {count} params", actual == count, f"got: {actual}")

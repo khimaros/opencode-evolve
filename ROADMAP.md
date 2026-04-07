@@ -4,6 +4,7 @@
 
 ## done
 
+- [x] end-to-end test that captures the actual LLM request (system prompt + tool defs) produced by real opencode when the evolve plugin is loaded, via a mock openai-compatible server
 - [x] add timezone parameter to evolve_datetime tool (default: UTC)
 - [x] log full tool call results (especially errors) instead of 200-char truncated preview
 - [x] missing/unhandled hooks should not produce error logs or trigger recovery
@@ -17,8 +18,6 @@
 - [x] archive cleanup mode for heartbeat sessions
 - [x] prevent overlapping heartbeat executions
 - [x] skip heartbeat when other sessions are active
-
 - [x] set cwd to WORKSPACE for all hook spawns (including heartbeat)
 - [x] scope session operations (heartbeat, actions) to WORKSPACE directory
-
 - [x] initial commit of pre-existing files when git repo is first created

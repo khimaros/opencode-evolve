@@ -24,6 +24,10 @@ class HookResult(TypedDict, total=False):
 
 HOOKS, TOOLS = {}, {}
 
+# parameter spec: dict metadata = typed param, bare string = string type (backwards compat)
+def param(description, type="string", optional=False):
+    return {"type": type, "description": description, "optional": optional}
+
 def hook(fn):
     HOOKS[fn.__name__] = fn
     return fn
@@ -64,30 +68,49 @@ def system_prompt(mode=None):
 # --- tools ---
 
 @tool
-def note_list() -> HookResult:
+def note_list(
+    include_hidden: Annotated[str, param("include hidden (dot-prefixed) notes", type="boolean", optional=True)] = "false",
+) -> HookResult:
     """list all notes"""
     names = note_names()
+    if include_hidden not in ("true", "1"):
+        names = [n for n in names if not n.startswith(".")]
     return {"result": f"notes: {', '.join(names)}" if names else "no notes yet"}
 
 @tool(permission={"arg": "name"})
 def note_read(
     name: Annotated[str, "note filename (e.g. todo.md)"],
+    limit: Annotated[str, param("maximum lines to return (default: all)", type="number", optional=True)] = "",
 ) -> HookResult:
     """read a note"""
     try:
         content = (NOTES / name).read_text()
     except FileNotFoundError:
         return {"result": f"not found: {name}"}
+    if limit:
+        try:
+            content = "\n".join(content.splitlines()[:int(limit)])
+        except ValueError:
+            pass
     return {"result": content}
 
 @tool(permission={"arg": "name"})
 def note_write(
     name: Annotated[str, "note filename (e.g. todo.md)"],
     content: Annotated[str, "full content for the note"],
+    tags: Annotated[object, param("optional tags to prepend as a header line", type="array[string]", optional=True)] = None,
+    metadata: Annotated[object, param("optional key/value metadata to prepend as json", type="object", optional=True)] = None,
+    extras: Annotated[object, param("optional free-form extras (any json value)", type="any", optional=True)] = None,
+    raw_list: Annotated[object, param("optional list with mixed values", type="array", optional=True)] = None,
 ) -> HookResult:
     """write a note"""
     NOTES.mkdir(parents=True, exist_ok=True)
-    (NOTES / name).write_text(content)
+    body = content
+    if metadata:
+        body = json.dumps(metadata) + "\n" + body
+    if tags:
+        body = f"tags: {', '.join(tags)}\n" + body
+    (NOTES / name).write_text(body)
     return {"result": f"wrote {name}", "modified": [name],
             "notify": [{"type": "note_changed", "files": [name]}]}
 
@@ -126,7 +149,7 @@ def tool_defs():
 def discover(ctx: dict) -> HookResult:
     names = [t["name"] for t in tool_defs()]
     debug(f"tools: {', '.join(names)}")
-    return {"name": "evolve", "test": "hello_test.py", "tools": tool_defs()}
+    return {"name": "hello", "test": "hello_test.py", "tools": tool_defs()}
 
 @hook
 def mutate_request(ctx: dict) -> HookResult:
