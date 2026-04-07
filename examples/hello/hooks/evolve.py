@@ -67,13 +67,21 @@ def system_prompt(mode=None):
 
 # --- tools ---
 
+def truthy(v):
+    """coerce json-decoded bool, int, or string to a python bool"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() in ("true", "1", "yes", "on")
+
 @tool
 def note_list(
     include_hidden: Annotated[str, param("include hidden (dot-prefixed) notes", type="boolean", optional=True)] = "false",
 ) -> HookResult:
     """list all notes"""
     names = note_names()
-    if include_hidden not in ("true", "1"):
+    if not truthy(include_hidden):
         names = [n for n in names if not n.startswith(".")]
     return {"result": f"notes: {', '.join(names)}" if names else "no notes yet"}
 
@@ -98,18 +106,23 @@ def note_read(
 def note_write(
     name: Annotated[str, "note filename (e.g. todo.md)"],
     content: Annotated[str, "full content for the note"],
-    tags: Annotated[object, param("optional tags to prepend as a header line", type="array[string]", optional=True)] = None,
-    metadata: Annotated[object, param("optional key/value metadata to prepend as json", type="object", optional=True)] = None,
-    extras: Annotated[object, param("optional free-form extras (any json value)", type="any", optional=True)] = None,
-    raw_list: Annotated[object, param("optional list with mixed values", type="array", optional=True)] = None,
+    tags: Annotated[object, param("optional tags to prepend as a 'tags:' header line", type="array[string]", optional=True)] = None,
+    metadata: Annotated[object, param("optional key/value metadata, json-encoded into the header", type="object", optional=True)] = None,
+    extras: Annotated[object, param("optional free-form extras (any json value), json-encoded as 'extras:' header line", type="any", optional=True)] = None,
+    raw_list: Annotated[object, param("optional mixed-type list, json-encoded as 'items:' header line", type="array", optional=True)] = None,
 ) -> HookResult:
     """write a note"""
     NOTES.mkdir(parents=True, exist_ok=True)
-    body = content
-    if metadata:
-        body = json.dumps(metadata) + "\n" + body
+    headers = []
     if tags:
-        body = f"tags: {', '.join(tags)}\n" + body
+        headers.append(f"tags: {', '.join(str(t) for t in tags)}")
+    if metadata:
+        headers.append(f"metadata: {json.dumps(metadata)}")
+    if extras is not None:
+        headers.append(f"extras: {json.dumps(extras)}")
+    if raw_list:
+        headers.append(f"items: {json.dumps(raw_list)}")
+    body = ("\n".join(headers) + "\n" + content) if headers else content
     (NOTES / name).write_text(body)
     return {"result": f"wrote {name}", "modified": [name],
             "notify": [{"type": "note_changed", "files": [name]}]}
