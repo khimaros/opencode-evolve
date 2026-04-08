@@ -7,12 +7,12 @@ import { homedir } from 'os'
 import path from 'node:path'
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, cpSync, chmodSync, mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { type EvolveConfig, type HookRegistration, loadConfig } from './config.js'
-import { editContent } from './edit.js'
-import { parseHookOutput, mergeResults, toolOutputPreview } from './hook.js'
-import { formatDatetime } from './datetime.js'
-import { safePath, existingPath, discoverHookPaths } from './path.js'
-import { permissionPatterns } from './permission.js'
+import { type EvolveConfig, type HookRegistration, loadConfig } from './config'
+import { editContent } from './edit'
+import { parseHookOutput, mergeResults, toolOutputPreview } from './hook'
+import { formatDatetime } from './datetime'
+import { safePath, existingPath, discoverHookPaths } from './path'
+import { permissionPatterns } from './permission'
 
 const execFileAsync = promisify(execFile)
 
