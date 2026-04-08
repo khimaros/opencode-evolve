@@ -4,6 +4,7 @@
 
 ## done
 
+- [x] extend opencode integration test to cover the heartbeat flow (stall the build request so a heartbeat tick fires, then assert on the captured heartbeat chat/completions)
 - [x] end-to-end test that captures the actual LLM request (system prompt + tool defs) produced by real opencode when the evolve plugin is loaded, via a mock openai-compatible server
 - [x] add timezone parameter to evolve_datetime tool (default: UTC)
 - [x] log full tool call results (especially errors) instead of 200-char truncated preview

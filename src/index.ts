@@ -771,8 +771,12 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
   await commitWorkspace('initial')
 
   // workspace-scoped client for session operations (heartbeat, actions, etc.)
-  // WARNING: this only works if --port= is specified explicitly to `opencode serve`
-  const client = createOpencodeClient({ baseUrl: serverUrl.toString(), directory: WORKSPACE })
+  // WARNING: the rebuilt client only works if --port= is specified explicitly
+  // to `opencode serve`. when WORKSPACE matches the project directory we can
+  // skip the rebuild and reuse projectClient, which works in `opencode run` too.
+  const client = path.resolve(WORKSPACE) === path.resolve(directory)
+    ? projectClient
+    : createOpencodeClient({ baseUrl: serverUrl.toString(), directory: WORKSPACE })
 
   const registeredTools = await discoverTools(client)
   debug(`registered tools: ${Object.keys(registeredTools).join(', ')}`)
@@ -796,7 +800,7 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
     const heartbeatModel = CONFIG.model || loadModel() || lastModel
     debug(`heartbeat: tick start (${heartbeatModel?.providerID}/${heartbeatModel?.modelID})`)
     try {
-      if (await hasActiveSessions()) {
+      if (CONFIG.heartbeat_skip_active && await hasActiveSessions()) {
         debug('heartbeat: tick skipped (other sessions active)')
         return
       }

@@ -17,7 +17,7 @@ strategy:
 """
 
 import json, os, shlex, shutil, socket, subprocess, sys, tempfile, threading, time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +62,24 @@ def check(desc, ok, detail=""):
 captured = []
 capture_lock = threading.Lock()
 
+# stall the first build request long enough for at least one heartbeat tick
+# to fire inside the still-alive opencode process. heartbeat requests bypass
+# the stall so they can complete and be captured.
+HEARTBEAT_MS = 500
+STALL_SECONDS = 5
+stalled_once = False
+
+def is_heartbeat_request(body):
+    for m in body.get("messages", []) or []:
+        c = m.get("content")
+        if isinstance(c, str) and "[heartbeat]" in c:
+            return True
+        if isinstance(c, list):
+            for p in c:
+                if isinstance(p, dict) and "[heartbeat]" in (p.get("text") or ""):
+                    return True
+    return False
+
 SSE_RESPONSE = (
     'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
     '"choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
@@ -83,6 +101,13 @@ class MockHandler(BaseHTTPRequestHandler):
             body = {"_raw": raw.decode("utf-8", "replace")}
         with capture_lock:
             captured.append({"path": self.path, "headers": dict(self.headers), "body": body})
+        global stalled_once
+        if (not stalled_once
+                and "chat/completions" in self.path
+                and body.get("tools")
+                and not is_heartbeat_request(body)):
+            stalled_once = True
+            time.sleep(STALL_SECONDS)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -103,7 +128,7 @@ def free_port():
 
 def start_mock():
     port = free_port()
-    server = HTTPServer(("127.0.0.1", port), MockHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     return server, port
@@ -122,16 +147,14 @@ check("plugin built", plugin_path.exists(), f"missing: {plugin_path}")
 # --- set up workspace ---
 
 workdir = Path(tempfile.mkdtemp(prefix="evolve-llm-test-"))
-evolve_workspace = workdir / "workspace"
-project_dir = workdir / "project"
-project_dir.mkdir()
-
-# seed the evolve workspace from the hello example so its hook is autodiscovered
-# and exposes @tool-annotated functions with typed/optional Annotated params.
-# this lets us verify hook-defined tools flow all the way through to the LLM
-# request with correct JSON schemas.
+# seed the project from the hello example so its hook is autodiscovered and
+# exposes @tool-annotated functions. WORKSPACE == project_dir so the plugin's
+# heartbeat client can reuse projectClient (workspace-scoped client rebuild
+# doesn't work under `opencode run`, only `opencode serve --port=`).
 hello_src = PROJECT_ROOT / "examples" / "hello"
-shutil.copytree(hello_src, evolve_workspace)
+shutil.copytree(hello_src, workdir / "project")
+project_dir = workdir / "project"
+evolve_workspace = project_dir
 # ensure hook is executable after copy
 hook_file = evolve_workspace / "hooks" / "evolve.py"
 hook_file.chmod(0o755)
@@ -158,6 +181,13 @@ config = {
 env = {
     **os.environ,
     "OPENCODE_EVOLVE_WORKSPACE": str(evolve_workspace),
+    "EVOLVE_HEARTBEAT_MS": str(HEARTBEAT_MS),
+    # heartbeat tick fires before chat.message captures the model, so seed it
+    "EVOLVE_MODEL": "mock/mock",
+    # the build session is intentionally stalled — don't let heartbeat skip on it
+    "EVOLVE_HEARTBEAT_SKIP_ACTIVE": "false",
+    # no custom agents in the test opencode.json — use the builtin
+    "EVOLVE_HEARTBEAT_AGENT": "build",
     "OPENAI_API_KEY": "test",
     # avoid opencode trying to autoupdate / share
     "CI": "1",
@@ -175,29 +205,35 @@ proc = subprocess.Popen(
     text=True,
 )
 
-# wait up to 90s for a chat-completions request that carries tools
-# (opencode will also fire title-generation and possibly other calls with
-# no tools — we want the real build-agent request)
+# wait up to 90s for two tools-bearing chat-completions requests:
+#   1) the real build-agent request (stalled by the mock for STALL_SECONDS)
+#   2) the heartbeat tick that fires inside the plugin while the build is stalled
+# (opencode also fires title-generation with no tools — ignored)
 deadline = time.time() + 90
 chat_req = None
+hb_req_seen = None
 while time.time() < deadline:
     with capture_lock:
         for c in captured:
             if "chat/completions" not in c["path"]:
                 continue
-            if c["body"].get("tools"):
-                chat_req = c
-                break
-    if chat_req:
+            if not c["body"].get("tools"):
+                continue
+            if is_heartbeat_request(c["body"]):
+                hb_req_seen = hb_req_seen or c
+            else:
+                chat_req = chat_req or c
+    if chat_req and hb_req_seen:
         break
     if proc.poll() is not None:
-        # give pending requests a moment to flush
         time.sleep(0.5)
         with capture_lock:
             for c in captured:
                 if "chat/completions" in c["path"] and c["body"].get("tools"):
-                    chat_req = c
-                    break
+                    if is_heartbeat_request(c["body"]):
+                        hb_req_seen = hb_req_seen or c
+                    else:
+                        chat_req = chat_req or c
         break
     time.sleep(0.2)
 
@@ -209,8 +245,8 @@ except subprocess.TimeoutExpired:
     proc.kill()
     stdout, stderr = proc.communicate()
 
-(ARTIFACTS / "opencode.stdout.log").write_text(stdout or "")
-(ARTIFACTS / "opencode.stderr.log").write_text(stderr or "")
+(ARTIFACTS / "opencode_integration.stdout.log").write_text(stdout or "")
+(ARTIFACTS / "opencode_integration.stderr.log").write_text(stderr or "")
 
 server.shutdown()
 
@@ -224,8 +260,8 @@ if not chat_req:
 
 # --- dump artifact ---
 
-(ARTIFACTS / "llm_request.json").write_text(json.dumps(chat_req, indent=2, default=str))
-print(f"captured request dumped to {ARTIFACTS / 'llm_request.json'}")
+(ARTIFACTS / "opencode_integration.build_request.json").write_text(json.dumps(chat_req, indent=2, default=str))
+print(f"captured request dumped to {ARTIFACTS / 'opencode_integration.build_request.json'}")
 
 body = chat_req["body"]
 
@@ -388,6 +424,50 @@ for opt_field in ("tags", "metadata", "extras", "raw_list"):
 p = prop("hello_note_delete", "name")
 check("note_delete.name is string", p.get("type") == "string", f"got: {p}")
 check("note_delete.name is required", "name" in required("hello_note_delete"))
+
+# --- assertions on heartbeat flow ---
+# while the build request was stalled, the plugin's heartbeat tick should have
+# fired (EVOLVE_HEARTBEAT_MS << STALL_SECONDS), creating a new session and
+# sending a chat/completions request whose user message starts with [heartbeat]
+# and whose system prompt comes from hello's heartbeat() hook.
+
+hb_req = None
+with capture_lock:
+    for c in captured:
+        if "chat/completions" in c["path"] and is_heartbeat_request(c["body"]):
+            hb_req = c
+            break
+
+check("heartbeat chat/completions request captured", hb_req is not None,
+      f"captured paths: {[c['path'] for c in captured]}")
+
+if hb_req:
+    (ARTIFACTS / "opencode_integration.heartbeat_request.json").write_text(
+        json.dumps(hb_req, indent=2, default=str))
+    hb_body = hb_req["body"]
+    hb_messages = hb_body.get("messages", [])
+
+    def message_text(m):
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return "".join(p.get("text", "") for p in c if isinstance(p, dict))
+        return ""
+
+    user_msgs = [message_text(m) for m in hb_messages if m.get("role") == "user"]
+    check("heartbeat user message has [heartbeat] prefix",
+          any("[heartbeat]" in t for t in user_msgs),
+          f"user msgs: {[t[:80] for t in user_msgs]}")
+    check("heartbeat user message contains hello prompt body",
+          any("Review your notes" in t for t in user_msgs),
+          f"user msgs: {[t[:80] for t in user_msgs]}")
+
+    hb_system = "\n".join(
+        message_text(m) for m in hb_messages if m.get("role") == "system")
+    check("heartbeat system prompt non-empty", len(hb_system) > 0)
+    check("heartbeat request carries tools",
+          isinstance(hb_body.get("tools"), list) and len(hb_body["tools"]) > 0)
 
 # --- cleanup ---
 

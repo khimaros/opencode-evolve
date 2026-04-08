@@ -12,6 +12,7 @@ export interface EvolveConfig {
   heartbeat_cleanup: 'none' | 'new' | 'archive' | 'compact'
   heartbeat_cleanup_count: number | null
   heartbeat_cleanup_tokens: number | null
+  heartbeat_skip_active: boolean
 }
 
 export const DEFAULTS: EvolveConfig = {
@@ -23,6 +24,7 @@ export const DEFAULTS: EvolveConfig = {
   heartbeat_cleanup: 'none',
   heartbeat_cleanup_count: null,
   heartbeat_cleanup_tokens: null,
+  heartbeat_skip_active: true,
 }
 
 // --- per-hook registration data returned by discover ---
@@ -44,6 +46,7 @@ export function stripJsoncComments(raw: string): string {
 export function coerceEnv(val: string, existing: any): any {
   if (existing === null || typeof existing === 'string') return val === 'null' ? null : val
   if (typeof existing === 'number') return val === 'null' ? null : Number(val)
+  if (typeof existing === 'boolean') return val !== 'false' && val !== '0' && val !== ''
   return val
 }
 
