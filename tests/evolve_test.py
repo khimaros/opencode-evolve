@@ -71,7 +71,10 @@ console.log(JSON.stringify([
   { desc: 'null string for string', got: coerceEnv('null', 'existing'), expected: null },
   { desc: 'number coercion', got: coerceEnv('42', 100), expected: 42 },
   { desc: 'null string for number', got: coerceEnv('null', 100), expected: null },
-  { desc: 'fallback for other types', got: coerceEnv('val', true), expected: 'val' },
+  { desc: 'boolean true from "true"', got: coerceEnv('true', false), expected: true },
+  { desc: 'boolean false from "false"', got: coerceEnv('false', true), expected: false },
+  { desc: 'boolean false from "0"', got: coerceEnv('0', true), expected: false },
+  { desc: 'boolean false from ""', got: coerceEnv('', true), expected: false },
 ]));
 """)
 if err:
