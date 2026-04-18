@@ -8,7 +8,6 @@ from typing import Annotated, TypedDict, get_type_hints
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 NOTES = WORKSPACE / "traits"
-PROMPTS = WORKSPACE / "prompts"
 
 class HookResult(TypedDict, total=False):
     system: list[str]
@@ -25,8 +24,13 @@ class HookResult(TypedDict, total=False):
 HOOKS, TOOLS = {}, {}
 
 # parameter spec: dict metadata = typed param, bare string = string type (backwards compat)
-def param(description, type="string", optional=False):
-    return {"type": type, "description": description, "optional": optional}
+def param(description, type="string", optional=False, enum=None):
+    spec = {"type": type, "description": description, "optional": optional}
+    if enum:
+        spec["enum"] = list(enum)
+    return spec
+
+NOTE_PRIORITIES = ["low", "normal", "high"]
 
 def hook(fn):
     HOOKS[fn.__name__] = fn
@@ -50,20 +54,19 @@ def note_names():
         return []
     return sorted(f.name for f in NOTES.iterdir() if f.is_file())
 
-def prompt_path(name):
-    return PROMPTS / f"{name}.md"
-
-def system_prompt(mode=None):
-    parts = [prompt_path("preamble").read_text()]
+# compose system prompt from evolve-injected prompt contract parts, appending
+# the notes list and an env block. preamble/stage bodies come from ctx.prompts.
+def system_prompt(prompts, mode=None):
+    parts = [prompts.get("preamble", "")]
     if mode:
-        parts.append(prompt_path(mode).read_text())
+        parts.append(prompts.get(mode, ""))
     notes = note_names()
     if notes:
         parts.append(f"\ncurrent notes: {', '.join(notes)}\n")
     parts.append(
         f"\n<env>\nSession start time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n</env>\n"
     )
-    return ["".join(parts)]
+    return ["".join(p for p in parts if p)]
 
 # --- tools ---
 
@@ -110,6 +113,7 @@ def note_write(
     metadata: Annotated[object, param("optional key/value metadata, json-encoded into the header", type="object", optional=True)] = None,
     extras: Annotated[object, param("optional free-form extras (any json value), json-encoded as 'extras:' header line", type="any", optional=True)] = None,
     raw_list: Annotated[object, param("optional mixed-type list, json-encoded as 'items:' header line", type="array", optional=True)] = None,
+    priority: Annotated[str, param(f"optional priority. one of: {', '.join(NOTE_PRIORITIES)}", optional=True, enum=NOTE_PRIORITIES)] = "",
 ) -> HookResult:
     """write a note"""
     NOTES.mkdir(parents=True, exist_ok=True)
@@ -122,6 +126,8 @@ def note_write(
         headers.append(f"extras: {json.dumps(extras)}")
     if raw_list:
         headers.append(f"items: {json.dumps(raw_list)}")
+    if priority:
+        headers.append(f"priority: {priority}")
     body = ("\n".join(headers) + "\n" + content) if headers else content
     (NOTES / name).write_text(body)
     return {"result": f"wrote {name}", "modified": [name],
@@ -167,7 +173,9 @@ def discover(ctx: dict) -> HookResult:
 @hook
 def mutate_request(ctx: dict) -> HookResult:
     debug(f"notes: {', '.join(note_names())}")
-    return {"system": system_prompt("chat")}
+    # hello appends a notes list and env block; preamble/chat come from
+    # ctx.prompts (the evolve prompt contract).
+    return {"system": system_prompt(ctx.get("prompts", {}), "chat")}
 
 @hook
 def format_notification(ctx: dict) -> HookResult:
@@ -196,15 +204,11 @@ def idle(ctx: dict) -> HookResult:
 @hook
 def heartbeat(ctx: dict) -> HookResult:
     debug(f"notes: {', '.join(note_names())}")
-    try:
-        user = prompt_path("heartbeat").read_text()
-        if not user.strip():
-            debug("heartbeat prompt is empty, skipping")
-            return {}
-        return {"system": system_prompt("heartbeat"), "user": user}
-    except FileNotFoundError:
-        debug("heartbeat.md not found, skipping")
+    prompts = ctx.get("prompts", {})
+    user = (prompts.get("heartbeat") or "").strip()
+    if not user:
         return {}
+    return {"system": system_prompt(prompts, "heartbeat"), "user": user}
 
 @hook
 def recover(ctx: dict) -> HookResult:
@@ -222,11 +226,8 @@ def tool_after(ctx: dict) -> HookResult:
 @hook
 def compacting(ctx: dict) -> HookResult:
     debug(f"notes: {', '.join(note_names())}")
-    try:
-        return {"prompt": prompt_path("compaction").read_text()}
-    except FileNotFoundError:
-        debug("compaction.md not found, skipping")
-        return {}
+    # evolve falls back to the compaction.md contract file when we return nothing
+    return {}
 
 @hook
 def execute_tool(ctx: dict) -> HookResult:

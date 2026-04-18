@@ -7,9 +7,30 @@ from pathlib import Path
 
 PASS = FAIL = 0
 
+PROMPT_CONTRACT = {
+    "preamble": "preamble.md",
+    "chat": "chat.md",
+    "heartbeat": "heartbeat.md",
+    "compaction": "compaction.md",
+    "recover": "recover.md",
+}
+
+def load_prompts(workspace):
+    """mirror evolve plugin's loadPrompts() for hook tests."""
+    out = {}
+    for name, file in PROMPT_CONTRACT.items():
+        p = os.path.join(workspace, "prompts", file)
+        if os.path.exists(p):
+            out[name] = open(p).read()
+    return out
+
 def call_hook(hook_path, name, ctx=None):
-    """call a hook and return (merged_result, logs, exit_code)."""
-    input_data = json.dumps(ctx or {})
+    """call a hook and return (merged_result, logs, exit_code).
+    auto-injects ctx.prompts from workspace/prompts/ to mirror evolve."""
+    full = dict(ctx or {})
+    if "prompts" not in full:
+        full["prompts"] = load_prompts(os.path.dirname(os.path.dirname(hook_path)))
+    input_data = json.dumps(full)
     proc = subprocess.run(
         [hook_path, name], input=input_data, capture_output=True, text=True,
     )
@@ -90,10 +111,19 @@ try:
     # --- discover tool parameter schemas ---
 
     tools_by_name = {t["name"]: t for t in r["tools"]}
-    expected_counts = {"note_list": 1, "note_read": 2, "note_write": 6, "note_delete": 1}
+    expected_counts = {"note_list": 1, "note_read": 2, "note_write": 7, "note_delete": 1}
     for name, count in expected_counts.items():
         actual = len(tools_by_name[name]["parameters"])
         check(f"{name} has {count} params", actual == count, f"got: {actual}")
+
+    # enum param: note_write.priority exposes enum metadata in discovery
+    priority_spec = tools_by_name["note_write"]["parameters"].get("priority", {})
+    check("note_write.priority is a typed param", isinstance(priority_spec, dict),
+          f"got: {type(priority_spec).__name__}")
+    check("note_write.priority has enum",
+          priority_spec.get("enum") == ["low", "normal", "high"],
+          f"got: {priority_spec.get('enum')}")
+    check("note_write.priority is optional", priority_spec.get("optional") is True)
 
     # --- mutate_request ---
 
@@ -155,7 +185,8 @@ try:
     # --- compacting ---
 
     r, logs, _ = call_hook(hook, "compacting")
-    check("compacting returns prompt key", has_key(r, "prompt"))
+    check("compacting defers to evolve default (returns no prompt)", not has_key(r, "prompt"),
+          f"got: {r}")
     check("compacting logs notes", any("notes:" in l for l in logs))
 
     # --- note_list ---
@@ -201,8 +232,17 @@ try:
     content = open(os.path.join(tmp, "traits", "NEW.md")).read()
     check("note_write wrote file", content == "hello world")
 
+    # --- note_write with enum priority ---
+
+    r, _, _ = call_tool(hook, "note_write", {"name": "P.md", "content": "body", "priority": "high"})
+    check("note_write accepts enum value", "wrote" in r.get("result", ""))
+    content = open(os.path.join(tmp, "traits", "P.md")).read()
+    check("note_write priority header written", "priority: high" in content, f"got: {content!r}")
+    os.remove(os.path.join(tmp, "traits", "P.md"))
+
     # --- note_write returns notify ---
 
+    r, _, _ = call_tool(hook, "note_write", {"name": "NEW.md", "content": "hello world"})
     check("note_write returns notify", has_key(r, "notify"))
     check("note_write notify is list", isinstance(r.get("notify"), list))
     check("note_write notify has note_changed", any(n.get("type") == "note_changed" for n in r.get("notify", [])))
@@ -287,7 +327,7 @@ try:
     check("heartbeat with history returns system", has_key(r, "system"))
 
     r, _, _ = call_hook(hook, "compacting", {"history": sample_history})
-    check("compacting with history returns prompt", has_key(r, "prompt"))
+    check("compacting with history defers to default", not has_key(r, "prompt"))
 
     r, _, _ = call_hook(hook, "recover", {"failed_hook": "test", "error": "x", "history": sample_history})
     check("recover with history returns system", has_key(r, "system"))

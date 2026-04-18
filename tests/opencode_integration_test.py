@@ -314,6 +314,26 @@ missing_schema = [n for n in tool_names if not any(
 )]
 check("all tools have parameters schema", not missing_schema, f"missing: {missing_schema}")
 
+# --- prompt contract: evolve_prompt_{read,write,edit} must enum-constrain prompt arg ---
+EXPECTED_PROMPT_FILES = ["preamble.md", "chat.md", "heartbeat.md", "compaction.md", "recover.md"]
+
+def tool_params_local(name):
+    for t in tools:
+        fn = t.get("function", {})
+        if fn.get("name") == name:
+            return fn.get("parameters", {})
+    return {}
+
+for prompt_tool in ("evolve_prompt_read", "evolve_prompt_write", "evolve_prompt_edit"):
+    params = tool_params_local(prompt_tool)
+    prompt_prop = (params.get("properties") or {}).get("prompt") or {}
+    check(f"{prompt_tool}.prompt has enum",
+          set(prompt_prop.get("enum") or []) == set(EXPECTED_PROMPT_FILES),
+          f"got: {prompt_prop.get('enum')}")
+    check(f"{prompt_tool}.prompt description mentions contract",
+          "contract" in (prompt_prop.get("description") or "").lower(),
+          f"got: {prompt_prop.get('description')}")
+
 # --- assertions on hook-defined tools from examples/hello ---
 # hook prefix is "evolve" (from discover), so note_* → hello_note_*
 
@@ -367,6 +387,35 @@ check("note_write.tags is optional", "tags" not in required("hello_note_write"))
 p = prop("hello_note_write", "metadata")
 check("note_write.metadata is object", p.get("type") == "object", f"got: {p}")
 check("note_write.metadata is optional", "metadata" not in required("hello_note_write"))
+
+# enum param: note_write.priority is a string constrained to a fixed set
+p = prop("hello_note_write", "priority")
+check("note_write.priority has enum", p.get("enum") == ["low", "normal", "high"], f"got: {p}")
+check("note_write.priority is optional", "priority" not in required("hello_note_write"))
+
+# verify the captured schema actually rejects non-enum values per JSON Schema
+import jsonschema
+write_schema_full = tool_params("hello_note_write")
+valid_payload = {"name": "x.md", "content": "y", "priority": "high"}
+invalid_payload = {"name": "x.md", "content": "y", "priority": "urgent"}
+ok_valid = True
+try:
+    jsonschema.validate(valid_payload, write_schema_full)
+except jsonschema.ValidationError as e:
+    ok_valid = False
+    valid_err = str(e)
+check("note_write valid enum value passes jsonschema validation",
+      ok_valid, f"unexpectedly rejected: {valid_err if not ok_valid else ''}")
+ok_invalid = False
+invalid_err = ""
+try:
+    jsonschema.validate(invalid_payload, write_schema_full)
+except jsonschema.ValidationError as e:
+    ok_invalid = True
+    invalid_err = str(e)
+check("note_write invalid enum value is rejected by jsonschema",
+      ok_invalid and "priority" in invalid_err,
+      f"got: {invalid_err or '(no error)'}")
 
 # verify commit fa5b1d7 ("more precise zod schema for nested objects"):
 # object/array/any params must expose the explicit jsonValue primitive union
@@ -468,6 +517,145 @@ if hb_req:
     check("heartbeat system prompt non-empty", len(hb_system) > 0)
     check("heartbeat request carries tools",
           isinstance(hb_body.get("tools"), list) and len(hb_body["tools"]) > 0)
+
+# --- end-to-end enum rejection ---
+# second opencode run against a mock that emits a tool_call for hello_note_write
+# with priority="urgent" (not in the enum). opencode should reject the args and
+# the next chat/completions request should carry a tool-result with an error.
+
+rej_captured = []
+rej_lock = threading.Lock()
+rej_step = [0]  # [0] = count of non-heartbeat tools-bearing requests seen
+
+BAD_ARGS = '{"name":"x.md","content":"y","priority":"urgent"}'
+def sse_tool_call(args):
+    return (
+        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
+        '"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,'
+        '"id":"call_1","type":"function","function":{"name":"hello_note_write",'
+        f'"arguments":{json.dumps(args)}}}}}]}}}}]}}\n\n'
+        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
+        '"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],'
+        '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+        'data: [DONE]\n\n'
+    ).encode()
+
+SSE_DONE = (
+    'data: {"id":"2","object":"chat.completion.chunk","created":0,"model":"mock",'
+    '"choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":null}]}\n\n'
+    'data: {"id":"2","object":"chat.completion.chunk","created":0,"model":"mock",'
+    '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+    '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+    'data: [DONE]\n\n'
+).encode()
+
+class RejectionHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"object":"list","data":[]}')
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"_raw": raw.decode("utf-8", "replace")}
+        with rej_lock:
+            rej_captured.append({"path": self.path, "body": body})
+            is_tools_req = ("chat/completions" in self.path and body.get("tools")
+                            and not is_heartbeat_request(body))
+            if is_tools_req:
+                rej_step[0] += 1
+                step = rej_step[0]
+            else:
+                step = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        # step 1: emit the bad tool call; all subsequent: emit "done"
+        self.wfile.write(sse_tool_call(BAD_ARGS) if step == 1 else SSE_DONE)
+
+rej_port = free_port()
+rej_server = ThreadingHTTPServer(("127.0.0.1", rej_port), RejectionHandler)
+threading.Thread(target=rej_server.serve_forever, daemon=True).start()
+rej_base = f"http://127.0.0.1:{rej_port}/v1"
+
+rej_project = Path(tempfile.mkdtemp(prefix="evolve-rej-test-"))
+shutil.copytree(hello_src, rej_project / "project", dirs_exist_ok=False)
+rej_dir = rej_project / "project"
+(rej_dir / "hooks" / "evolve.py").chmod(0o755)
+rej_config = dict(config)
+rej_config["provider"] = {"mock": {
+    "name": "Mock", "options": {"apiKey": "test", "baseURL": rej_base},
+    "models": {"mock": {"name": "Mock Model"}},
+}}
+(rej_dir / "opencode.json").write_text(json.dumps(rej_config, indent=2))
+
+rej_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(rej_dir),
+           "EVOLVE_HEARTBEAT_MS": "999999"}  # disable heartbeat noise
+
+rej_proc = subprocess.Popen(
+    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "write a note"],
+    cwd=str(rej_dir), env=rej_env,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+
+# wait for a second tools-bearing request (the one carrying the tool result)
+rej_deadline = time.time() + 60
+followup = None
+while time.time() < rej_deadline:
+    with rej_lock:
+        tools_reqs = [c for c in rej_captured
+                      if "chat/completions" in c["path"] and c["body"].get("tools")
+                      and not is_heartbeat_request(c["body"])]
+        if len(tools_reqs) >= 2:
+            followup = tools_reqs[1]
+            break
+    if rej_proc.poll() is not None:
+        break
+    time.sleep(0.2)
+
+if rej_proc.poll() is None:
+    rej_proc.terminate()
+try:
+    rej_stdout, rej_stderr = rej_proc.communicate(timeout=15)
+except subprocess.TimeoutExpired:
+    rej_proc.kill()
+    rej_stdout, rej_stderr = rej_proc.communicate()
+rej_server.shutdown()
+
+(ARTIFACTS / "opencode_rejection.stdout.log").write_text(rej_stdout or "")
+(ARTIFACTS / "opencode_rejection.stderr.log").write_text(rej_stderr or "")
+(ARTIFACTS / "opencode_rejection.captured.json").write_text(
+    json.dumps(rej_captured, indent=2, default=str))
+
+check("rejection: follow-up chat/completions captured", followup is not None,
+      f"captured: {len(rej_captured)} reqs, tools-bearing: "
+      f"{sum(1 for c in rej_captured if c['body'].get('tools') and not is_heartbeat_request(c['body']))}")
+
+if followup:
+    # find the tool-result message that opencode sent back
+    msgs = followup["body"].get("messages", [])
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    tool_text = " ".join(
+        (m.get("content") if isinstance(m.get("content"), str)
+         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
+        for m in tool_msgs
+    )
+    check("rejection: tool-result message present",
+          len(tool_msgs) > 0, f"roles: {[m.get('role') for m in msgs]}")
+    # the error should reference either the bad value or the field — zod error
+    # text typically includes both. accept any substring that proves rejection.
+    err_markers = ("urgent", "priority", "enum", "invalid")
+    check("rejection: tool-result carries an error about the invalid enum",
+          any(mk in tool_text.lower() for mk in err_markers),
+          f"tool_text: {tool_text[:400]}")
+
+shutil.rmtree(rej_project, ignore_errors=True)
 
 # --- cleanup ---
 

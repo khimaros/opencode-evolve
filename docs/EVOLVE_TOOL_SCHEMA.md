@@ -43,11 +43,22 @@ main defense.
 `param(..., optional=True)` calls `.optional()` on the schema, which adds the
 parameter to the tool schema but marks it as not required.
 
+## enum parameters
+
+`param(..., enum=[...])` constrains the value to one of the listed strings.
+when set, `buildToolArgs()` emits `tool.schema.enum([...])` and skips
+`parseTypeSchema` — so `type` is effectively ignored (enums are always string
+unions). the description is still used. pairs cleanly with `optional=True`.
+
+example: `param("task status", enum=["open", "closed"], optional=True)` →
+`{"type": "string", "enum": ["open", "closed"]}` in JSON Schema, rejecting any
+other value at the tool-call boundary.
+
 ## parameter resolution order
 
 in `buildToolArgs()`:
 - if the spec is a bare string → `tool.schema.string().describe(spec)`
-- if the spec is a dict (from `param()`) → extract `type`, `description`, `optional`, then call `parseTypeSchema(type, description)`
+- if the spec is a dict (from `param()`) → extract `type`, `description`, `optional`, `enum`; if `enum` is non-empty use `tool.schema.enum(...)`, otherwise call `parseTypeSchema(type, description)`
 
 ## source locations
 

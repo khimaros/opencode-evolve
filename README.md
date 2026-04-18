@@ -80,7 +80,7 @@ all executable files in `hooks/` are autodiscovered and called as subprocesses (
 $WORKSPACE/hooks/<hook> <hook_name>
 ```
 
-**input**: JSON on stdin with at minimum `{"hook": "<name>", ...context}`.
+**input**: JSON on stdin with at minimum `{"hook": "<name>", "prompts": {...}, ...context}`. evolve injects `prompts` into every hook call — a dict mapping contract stage names (`preamble`, `chat`, `heartbeat`, `compaction`, `recover`) to the contents of the corresponding prompt file in `prompts/`. missing files resolve to empty strings. see [prompt contract](#prompt-contract).
 
 **output**: JSONL on stdout. each line is a JSON object. lines with `{"log": "..."}` are printed to the debug log. all other lines are merged into the final result.
 
@@ -119,6 +119,7 @@ parameters support two formats:
 
 - **string** (backwards compat): `{"arg": "description"}` — registers as a string param
 - **typed**: `{"arg": {"type": "string", "description": "...", "optional": true}}` — registers with the specified type
+- **enum**: `{"arg": {"type": "string", "description": "...", "enum": ["a", "b", "c"]}}` — constrains the value to the listed options. the opencode tool-dispatch layer rejects invalid values before `execute_tool` is called and returns an error to the LLM.
 
 supported types: `string`, `number`, `boolean`, `object`, `array`, `any`
 
@@ -220,7 +221,7 @@ output:
 
 #### `compacting`
 
-called when opencode compacts a session. return a custom compaction prompt.
+called when opencode compacts a session. return a custom compaction prompt, or `{}` to fall back to the `compaction.md` contract file (evolve applies the default automatically).
 
 input:
 ```json
@@ -287,6 +288,22 @@ input (after):
 ```json
 {"hook": "tool_after", "session": {"id": "..."}, "tool": "tool_name", "callID": "...", "title": "...", "output": "..."}
 ```
+
+## prompt contract
+
+evolve defines a fixed set of prompt files in `prompts/` that map to lifecycle stages. hooks do not read these files directly — evolve loads them and injects their contents into every hook call as `ctx.prompts`, keyed by stage name.
+
+| stage | file | used at | default behavior if hook returns nothing |
+|-------|------|---------|------------------------------------------|
+| `preamble` | `preamble.md` | prepended to every system prompt | — (hooks compose this themselves) |
+| `chat` | `chat.md` | `mutate_request` | evolve emits `[preamble, chat]` as system prompt |
+| `heartbeat` | `heartbeat.md` | `heartbeat` | evolve emits `[preamble, heartbeat]` + `heartbeat` as user message |
+| `compaction` | `compaction.md` | `compacting` | evolve emits `compaction` as the compaction prompt |
+| `recover` | `recover.md` | `recover` | evolve emits `[preamble, recover]` + `recover` as user message |
+
+this makes evolve **standalone-functional**: a hook can return `{}` from any of the lifecycle hooks above and evolve will apply the contract defaults. hooks that want custom composition (e.g. appending dynamic context) receive the pieces via `ctx.prompts` and compose their own output.
+
+the `<prefix>_prompt_*` tools are enum-constrained to the contract files — agents cannot read or write prompts outside the contract.
 
 ## self-modification
 

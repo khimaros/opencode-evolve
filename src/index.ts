@@ -27,6 +27,30 @@ const LOG_PREFIX = '[evolve]'
 // observational hooks — failure should not trigger recover cascade
 const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification', 'idle', 'compacting'])
 
+// prompt contract: evolve owns prompts/ and injects stage defaults when a hook
+// returns no system/user/prompt for that stage. each entry names a stage role
+// and the filename evolve reads from prompts/. hooks receive the full set as
+// ctx.prompts and may recompose however they like (or return {} to accept the
+// default). the evolve_prompt_* tools are constrained to these filenames.
+const PROMPT_CONTRACT: Record<string, string> = {
+  preamble: 'preamble.md',      // always-on prelude, prepended to mutate_request and recover defaults
+  chat: 'chat.md',              // mutate_request (system) default body
+  heartbeat: 'heartbeat.md',    // heartbeat (user) default
+  compaction: 'compaction.md',  // compacting (prompt) default
+  recover: 'recover.md',        // recover (system+user) default body
+}
+const PROMPT_FILES = Object.values(PROMPT_CONTRACT) as [string, ...string[]]
+
+function loadPrompts(): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [name, file] of Object.entries(PROMPT_CONTRACT)) {
+    try {
+      out[name] = readFileSync(path.join(WORKSPACE, 'prompts', file), 'utf-8')
+    } catch { /* missing is allowed */ }
+  }
+  return out
+}
+
 const HOOK_PATHS = discoverHookPaths(WORKSPACE)
 // populated during init by registerHooks()
 const hookRegistrations = new Map<string, HookRegistration>()
@@ -182,7 +206,8 @@ async function callSingleHook(hookPath: string, name: string, context: object, s
   const start = Date.now()
   try {
     const history = sessionId ? sessionHistory.get(sessionId) || [] : undefined
-    const input = JSON.stringify({ hook: name, ...context, ...(history ? { history } : {}) })
+    const prompts = loadPrompts()
+    const input = JSON.stringify({ hook: name, prompts, ...context, ...(history ? { history } : {}) })
     debug(`hook ${name} [${stem}] start`)
     const { stdout } = await spawnHook(hookPath, name, input)
     const ms = Date.now() - start
@@ -215,6 +240,13 @@ async function callHook(name: string, context: object, sessionId?: string): Prom
     } catch (e: any) {
       if (name !== 'recover' && !NO_RECOVER_HOOKS.has(name)) {
         const recovery = await callHook('recover', { error: e.message, failed_hook: name })
+        // default recover: [preamble, recover] as system, recover.md as user
+        const p = loadPrompts()
+        if (!recovery.system?.length) {
+          const parts = [p.preamble, p.recover].filter(Boolean)
+          if (parts.length) recovery.system = parts
+        }
+        if (!recovery.user && p.recover) recovery.user = p.recover
         merged = mergeResults(merged, recovery)
       }
     }
@@ -433,10 +465,12 @@ function buildToolArgs(def: any): Record<string, any> {
       args[param] = tool.schema.string().describe(spec)
       continue
     }
-    const { type, description, optional } = spec as { type?: string, description?: string, optional?: boolean }
+    const { type, description, optional, enum: enumVals } = spec as { type?: string, description?: string, optional?: boolean, enum?: string[] }
     const desc = description || param
     // parse type annotations: string, array[string], object[string, number], etc.
-    let schema = parseTypeSchema(type || 'string', desc)
+    let schema = enumVals?.length
+      ? tool.schema.enum(enumVals as [string, ...string[]]).describe(desc)
+      : parseTypeSchema(type || 'string', desc)
     if (optional) schema = schema.optional()
     args[param] = schema
   }
@@ -492,25 +526,34 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
+  // the prompt contract: evolve reads these files at specific lifecycle stages
+  // and injects them as defaults if no hook handles the stage. editing these
+  // files changes behavior on the next invocation. the enum constrains the
+  // `prompt` arg to the contract set so the LLM can't write to stray files.
+  const contractDoc = Object.entries(PROMPT_CONTRACT)
+    .map(([stage, file]) => `  - ${file}: ${stage} stage default`)
+    .join('\n')
+  const promptArg = () => tool.schema.enum(PROMPT_FILES)
+    .describe(`prompt filename in prompts/. must be one of the contract files:\n${contractDoc}`)
+
   tools['evolve_prompt_list'] = tool({
-    description: `list prompt files in prompts/ (bare filenames like "chat.md")`,
+    description: `list evolve's prompt contract with each file's presence on disk. the contract defines which prompts evolve reads at each lifecycle stage; files outside the contract are ignored`,
     args: {},
     async execute() {
       debug('prompt_list')
-      try {
-        const files = readdirSync(path.join(WORKSPACE, 'prompts')).filter(f => f.endsWith('.md')).sort()
-        return `available prompts: ${files.join(', ')}`
-      } catch (e: any) {
-        debug(`prompt_list error: ${e.message}`)
-        return `error: ${e.message}`
+      const lines: string[] = []
+      for (const [stage, file] of Object.entries(PROMPT_CONTRACT)) {
+        const present = existsSync(path.join(WORKSPACE, 'prompts', file))
+        lines.push(`${file} (${stage}) — ${present ? 'present' : 'missing'}`)
       }
+      return `prompt contract:\n${lines.join('\n')}`
     },
   })
 
   tools['evolve_prompt_read'] = tool({
-    description: `read an existing prompt file from prompts/ (must already exist)`,
+    description: `read a prompt file from the evolve contract. these files drive lifecycle defaults — editing them affects the next mutate_request/heartbeat/compacting/recover invocation`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
+      prompt: promptArg(),
       offset: tool.schema.number().optional().describe('the line number to start reading from (1-indexed)'),
       limit: tool.schema.number().optional().describe('the maximum number of lines to read (defaults to 2000)'),
     },
@@ -531,9 +574,9 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
   })
 
   tools['evolve_prompt_write'] = tool({
-    description: `overwrite an existing prompt file in prompts/ (cannot create new files)`,
+    description: `overwrite a prompt file in the evolve contract (cannot create files outside the contract)`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
+      prompt: promptArg(),
       content: tool.schema.string().describe('full content for the prompt'),
     },
     async execute({ prompt, content }) {
@@ -553,9 +596,9 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
   })
 
   tools['evolve_prompt_edit'] = tool({
-    description: `edit an existing prompt file in prompts/ (find-and-replace, cannot create new files)`,
+    description: `edit a prompt file in the evolve contract by find-and-replace`,
     args: {
-      prompt: tool.schema.string().describe('prompt filename in prompts/ (e.g. "chat.md")'),
+      prompt: promptArg(),
       oldString: tool.schema.string().describe('the text to replace'),
       newString: tool.schema.string().describe('the text to replace it with (must be different from oldString)'),
       replaceAll: tool.schema.boolean().optional().describe('replace all occurrences (default false)'),
@@ -825,9 +868,16 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         persistRuntime({ heartbeat_count: 0, heartbeat_session: heartbeatSessionId })
       }
       const result = await callHook('heartbeat', { sessions: [] }, heartbeatSessionId)
-      if (!result.user) debug('heartbeat: hook returned no user message')
-      if (result.user) {
-        const parts = [{ type: 'text' as const, text: `[heartbeat] ${result.user}`, synthetic: true }]
+      // default: if no hook returned a user message, fall back to the heartbeat
+      // prompt contract file. missing file → skip tick (same as current behavior).
+      let userMsg = result.user
+      if (!userMsg) {
+        const fallback = (loadPrompts().heartbeat || '').trim()
+        if (fallback) userMsg = fallback
+        else debug('heartbeat: no user message (hook silent and no prompts/heartbeat.md)')
+      }
+      if (userMsg) {
+        const parts = [{ type: 'text' as const, text: `[heartbeat] ${userMsg}`, synthetic: true }]
         const resp = await client.session.prompt({
           path: { id: heartbeatSessionId },
           body: { agent: CONFIG.heartbeat_agent, model: heartbeatModel, parts },
@@ -841,6 +891,8 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         debug('heartbeat: prompt sent')
         const count = (loadRuntime().heartbeat_count || 0) + 1
         persistRuntime({ heartbeat_count: count, heartbeat_time: formatDatetime(new Date()) })
+      } else {
+        debug('heartbeat: tick skipped (no user message)')
       }
       if (result.modified?.length) trackModified(result.modified)
       if (result.notify?.length) await sendNotifications(client, result.notify, heartbeatSessionId!)
@@ -944,9 +996,17 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
             session: { id: input.sessionID },
             system: output.system,
           }, input.sessionID)
-          if (result.system?.length) {
-            output.system.splice(0, output.system.length, ...result.system)
-            sessionBasePrompt.set(input.sessionID, result.system)
+          // default composition when no hook (or no hook returned system):
+          // [preamble, chat] joined parts, each included only if present on disk.
+          let system = result.system
+          if (!system?.length) {
+            const p = loadPrompts()
+            const parts = [p.preamble, p.chat].filter(Boolean)
+            if (parts.length) system = parts
+          }
+          if (system?.length) {
+            output.system.splice(0, output.system.length, ...system)
+            sessionBasePrompt.set(input.sessionID, system)
           }
         }
       } catch (e: any) {
@@ -959,9 +1019,10 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         const result = await callHook('compacting', {
           session: { id: input.sessionID },
         }, input.sessionID)
-        if (result.prompt) {
-          output.prompt = result.prompt
-        }
+        // default: fall back to compaction prompt contract file
+        let prompt = result.prompt
+        if (!prompt) prompt = loadPrompts().compaction
+        if (prompt) output.prompt = prompt
       } catch (e: any) {
         debug(`compacting hook failed: ${e.message}`)
       }
