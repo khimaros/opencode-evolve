@@ -24,10 +24,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = PROJECT_ROOT / "tests" / ".artifacts"
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
-# opencode binary selection:
+# opencode binary selection. this test asserts opencode-side fixes (zod
+# cross-instance metadata, enum validation) that the upstream npm release
+# may not yet ship, so we refuse to silently fall back to `opencode` on
+# PATH — that masks regressions by running against an unrelated build.
 #   OPENCODE_BIN=<command>   full command override (space-separated, shlex-parsed)
 #   OPENCODE_SRC=<path>      local opencode checkout; runs via `bun run <src>/packages/opencode/src/index.ts`
-#   (default)                `opencode` from PATH
 def resolve_opencode_cmd():
     override = os.environ.get("OPENCODE_BIN")
     if override:
@@ -39,7 +41,11 @@ def resolve_opencode_cmd():
             print(f"OPENCODE_SRC set but entry point not found: {entry}", file=sys.stderr)
             sys.exit(2)
         return ["bun", "run", "--conditions=browser", str(entry)]
-    return ["opencode"]
+    print("error: set OPENCODE_BIN=<path-to-opencode> or OPENCODE_SRC=<opencode-checkout>.",
+          file=sys.stderr)
+    print("       `opencode` on PATH is not used — this test relies on local opencode fixes.",
+          file=sys.stderr)
+    sys.exit(2)
 
 OPENCODE_CMD = resolve_opencode_cmd()
 print(f"opencode command: {' '.join(OPENCODE_CMD)}")
@@ -178,8 +184,29 @@ config = {
 }
 (project_dir / "opencode.json").write_text(json.dumps(config, indent=2))
 
+# fully isolate opencode's global config / data / state from the user's
+# environment. opencode merges ~/.config/opencode/opencode.{json,jsonc} into
+# every project's config, which otherwise leaks MCP servers, providers,
+# plugins, etc. into these tests. point every xdg dir + HOME at a throwaway
+# tree so we're running against a pristine opencode install.
+fake_home = Path(tempfile.mkdtemp(prefix="evolve-home-"))
+for sub in (".config/opencode", ".local/share/opencode",
+            ".cache/opencode", ".local/state/opencode"):
+    (fake_home / sub).mkdir(parents=True, exist_ok=True)
+
+# start from os.environ for PATH / locale / node binaries, then strip any
+# opencode-specific vars that could re-inject outside config.
+base_env = {k: v for k, v in os.environ.items()
+            if not k.startswith(("OPENCODE_", "XDG_"))}
+
 env = {
-    **os.environ,
+    **base_env,
+    "HOME": str(fake_home),
+    "XDG_CONFIG_HOME": str(fake_home / ".config"),
+    "XDG_DATA_HOME": str(fake_home / ".local/share"),
+    "XDG_CACHE_HOME": str(fake_home / ".cache"),
+    "XDG_STATE_HOME": str(fake_home / ".local/state"),
+    "OPENCODE_TEST_HOME": str(fake_home),
     "OPENCODE_EVOLVE_WORKSPACE": str(evolve_workspace),
     "EVOLVE_HEARTBEAT_MS": str(HEARTBEAT_MS),
     # heartbeat tick fires before chat.message captures the model, so seed it
@@ -660,6 +687,7 @@ shutil.rmtree(rej_project, ignore_errors=True)
 # --- cleanup ---
 
 shutil.rmtree(workdir, ignore_errors=True)
+shutil.rmtree(fake_home, ignore_errors=True)
 
 # --- hard-fail: every tool parameter must carry a description ---
 # zod `.describe()` → JSON schema `description` must survive all the way into
