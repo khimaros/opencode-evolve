@@ -4,6 +4,8 @@
 
 ## done
 
+- [x] tighten integration test: assert build-request and heartbeat system prompts match the exact content the hello example should produce (preamble + stage + env); apply heartbeat hook's returned system prompt to the heartbeat session
+
 - [x] extend opencode integration test to cover the heartbeat flow (stall the build request so a heartbeat tick fires, then assert on the captured heartbeat chat/completions)
 - [x] end-to-end test that captures the actual LLM request (system prompt + tool defs) produced by real opencode when the evolve plugin is loaded, via a mock openai-compatible server
 - [x] add timezone parameter to evolve_datetime tool (default: UTC)

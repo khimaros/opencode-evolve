@@ -304,11 +304,29 @@ system_text = "\n".join(
     for m in system_msgs
 )
 check("system prompt non-empty", len(system_text) > 100, f"len={len(system_text)}")
-check("system prompt mentions environment", "<env>" in system_text or "environment" in system_text.lower())
-# hello's mutate_request fully replaces the system prompt with its own preamble,
-# so we check for the hello hook's contribution rather than opencode's env block
-check("system prompt from hello hook present", "note-taking assistant" in system_text,
-      f"got: {system_text[:200]}")
+
+# hello's mutate_request fully replaces opencode's system prompt with
+# preamble.md + chat.md + (optional notes line) + <env> block. assert each
+# piece verbatim from the hello example so drift in either the prompt files
+# or the composition logic in hooks/evolve.py is caught here.
+hello_prompts = PROJECT_ROOT / "examples" / "hello" / "prompts"
+expected_preamble = (hello_prompts / "preamble.md").read_text().strip()
+expected_chat = (hello_prompts / "chat.md").read_text().strip()
+check("system prompt contains hello preamble verbatim",
+      expected_preamble in system_text,
+      f"expected:\n{expected_preamble}\n\ngot:\n{system_text[:500]}")
+check("system prompt contains hello chat stage verbatim",
+      expected_chat in system_text,
+      f"expected:\n{expected_chat}\n\ngot:\n{system_text[:500]}")
+check("system prompt contains <env> block with session start",
+      "<env>" in system_text and "Session start time:" in system_text and "</env>" in system_text,
+      f"got: {system_text[:500]}")
+# only preamble + chat should appear in the build-agent prompt; heartbeat
+# stage body must not leak here.
+expected_heartbeat = (hello_prompts / "heartbeat.md").read_text().strip()
+check("system prompt does not include heartbeat stage body",
+      expected_heartbeat not in system_text,
+      "heartbeat prompt leaked into build-agent system prompt")
 
 # --- assertions on tools ---
 
@@ -542,6 +560,19 @@ if hb_req:
     hb_system = "\n".join(
         message_text(m) for m in hb_messages if m.get("role") == "system")
     check("heartbeat system prompt non-empty", len(hb_system) > 0)
+    # heartbeat composes preamble + heartbeat.md + <env>; chat.md must NOT appear.
+    check("heartbeat system prompt contains hello preamble verbatim",
+          expected_preamble in hb_system,
+          f"got: {hb_system[:500]}")
+    check("heartbeat system prompt contains heartbeat stage verbatim",
+          expected_heartbeat in hb_system,
+          f"got: {hb_system[:500]}")
+    check("heartbeat system prompt does not include chat stage body",
+          expected_chat not in hb_system,
+          "chat prompt leaked into heartbeat system prompt")
+    check("heartbeat system prompt contains <env> block",
+          "<env>" in hb_system and "Session start time:" in hb_system,
+          f"got: {hb_system[:500]}")
     check("heartbeat request carries tools",
           isinstance(hb_body.get("tools"), list) and len(hb_body["tools"]) > 0)
 
@@ -683,6 +714,137 @@ if followup:
           f"tool_text: {tool_text[:400]}")
 
 shutil.rmtree(rej_project, ignore_errors=True)
+
+# --- abstain: hook returning {} must not clobber opencode's system ---
+# regression test for the bug where evolve's mutate_request fallback imposed
+# a synthesized [preamble, chat] system (from prompts/*.md on disk) on every
+# request whose hook returned no system, AND cached that for the session.
+# opencode calls system.transform multiple times per session with different
+# payloads (main chat, title generation, ...). a hook that legitimately
+# abstains on non-main calls (e.g. persona's agent-marker check) would see
+# the first abstain cache-poison the session: every subsequent call — even
+# the main chat one — would skip the hook entirely and re-serve the wrong,
+# hook-less default. assert the abstained prompt does NOT leak into the
+# main chat request.
+
+abs_captured, abs_lock = [], threading.Lock()
+class AbstainHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"object":"list","data":[]}')
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"_raw": raw.decode("utf-8", "replace")}
+        with abs_lock:
+            abs_captured.append({"path": self.path, "body": body})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(SSE_RESPONSE)
+
+abs_port = free_port()
+abs_server = ThreadingHTTPServer(("127.0.0.1", abs_port), AbstainHandler)
+threading.Thread(target=abs_server.serve_forever, daemon=True).start()
+
+# distinctive marker strings — if these appear in any outgoing system prompt,
+# evolve injected its default-composition from prompts/*.md despite the hook
+# abstaining. they must not leak.
+ABSTAIN_PREAMBLE = "EVOLVE_DEFAULT_PREAMBLE_SENTINEL_ZZZ"
+ABSTAIN_CHAT = "EVOLVE_DEFAULT_CHAT_SENTINEL_QQQ"
+
+abs_project = Path(tempfile.mkdtemp(prefix="evolve-abstain-test-"))
+abs_dir = abs_project / "project"
+(abs_dir / "hooks").mkdir(parents=True)
+(abs_dir / "prompts").mkdir()
+(abs_dir / "prompts" / "preamble.md").write_text(ABSTAIN_PREAMBLE)
+(abs_dir / "prompts" / "chat.md").write_text(ABSTAIN_CHAT)
+abs_hook = abs_dir / "hooks" / "evolve.py"
+abs_hook.write_text(
+    "#!/usr/bin/env python3\n"
+    "import json, sys\n"
+    "name = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+    "try: ctx = json.loads(sys.stdin.read() or '{}')\n"
+    "except Exception: ctx = {}\n"
+    "if name == 'discover':\n"
+    "    print(json.dumps({'name': 'abstain'}), flush=True)\n"
+    # all other hooks (including mutate_request) intentionally produce nothing
+)
+abs_hook.chmod(0o755)
+
+abs_config = {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {"mock": {
+        "name": "Mock", "options": {"apiKey": "test", "baseURL": f"http://127.0.0.1:{abs_port}/v1"},
+        "models": {"mock": {"name": "Mock Model"}},
+    }},
+    "model": "mock/mock",
+    "small_model": "mock/mock",
+    "plugin": [plugin_path.as_uri()],
+}
+(abs_dir / "opencode.json").write_text(json.dumps(abs_config, indent=2))
+
+abs_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(abs_dir),
+           "EVOLVE_HEARTBEAT_MS": "999999"}
+
+abs_proc = subprocess.Popen(
+    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "hi"],
+    cwd=str(abs_dir), env=abs_env,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+
+abs_deadline = time.time() + 60
+while time.time() < abs_deadline:
+    with abs_lock:
+        if any("chat/completions" in c["path"] and c["body"].get("tools") for c in abs_captured):
+            break
+    if abs_proc.poll() is not None:
+        break
+    time.sleep(0.2)
+
+if abs_proc.poll() is None:
+    abs_proc.terminate()
+try:
+    abs_stdout, abs_stderr = abs_proc.communicate(timeout=15)
+except subprocess.TimeoutExpired:
+    abs_proc.kill()
+    abs_stdout, abs_stderr = abs_proc.communicate()
+abs_server.shutdown()
+
+(ARTIFACTS / "opencode_abstain.stdout.log").write_text(abs_stdout or "")
+(ARTIFACTS / "opencode_abstain.stderr.log").write_text(abs_stderr or "")
+(ARTIFACTS / "opencode_abstain.captured.json").write_text(
+    json.dumps(abs_captured, indent=2, default=str))
+
+abs_main = next((c for c in abs_captured
+                 if "chat/completions" in c["path"] and c["body"].get("tools")), None)
+check("abstain: main chat/completions request captured", abs_main is not None,
+      f"paths: {[c['path'] for c in abs_captured]}")
+
+if abs_main:
+    sys_text = "\n".join(
+        (m.get("content") if isinstance(m.get("content"), str)
+         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
+        for m in abs_main["body"].get("messages", []) if m.get("role") == "system")
+    check("abstain: preamble.md sentinel not injected into main request",
+          ABSTAIN_PREAMBLE not in sys_text,
+          f"evolve leaked preamble default despite hook abstain; system: {sys_text[:400]}")
+    check("abstain: chat.md sentinel not injected into main request",
+          ABSTAIN_CHAT not in sys_text,
+          f"evolve leaked chat default despite hook abstain; system: {sys_text[:400]}")
+    # sanity: opencode's own system should still be there (not wiped)
+    check("abstain: opencode's own system prompt preserved",
+          len(sys_text) > 0,
+          "system was empty — evolve wiped opencode's system on abstain")
+
+shutil.rmtree(abs_project, ignore_errors=True)
 
 # --- cleanup ---
 

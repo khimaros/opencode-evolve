@@ -877,6 +877,10 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         else debug('heartbeat: no user message (hook silent and no prompts/heartbeat.md)')
       }
       if (userMsg) {
+        // seed the frozen per-session system prompt with the heartbeat hook's
+        // composition (preamble + heartbeat stage), so mutate_request's default
+        // chat-mode prompt doesn't clobber heartbeat context on this session.
+        if (result.system?.length) sessionBasePrompt.set(heartbeatSessionId, result.system)
         const parts = [{ type: 'text' as const, text: `[heartbeat] ${userMsg}`, synthetic: true }]
         const resp = await client.session.prompt({
           path: { id: heartbeatSessionId },
@@ -996,17 +1000,15 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
             session: { id: input.sessionID },
             system: output.system,
           }, input.sessionID)
-          // default composition when no hook (or no hook returned system):
-          // [preamble, chat] joined parts, each included only if present on disk.
-          let system = result.system
-          if (!system?.length) {
-            const p = loadPrompts()
-            const parts = [p.preamble, p.chat].filter(Boolean)
-            if (parts.length) system = parts
-          }
-          if (system?.length) {
-            output.system.splice(0, output.system.length, ...system)
-            sessionBasePrompt.set(input.sessionID, system)
+          // only apply & cache when the hook actually returned a system. empty
+          // result = abstain: leave output.system alone and don't cache. opencode
+          // calls system.transform for several non-main-chat paths per session
+          // (title generation, summarization); each carries a different prompt
+          // and not all carry whatever content the hook gates on. caching an
+          // abstain would freeze a wrong prompt for the whole session.
+          if (result.system?.length) {
+            output.system.splice(0, output.system.length, ...result.system)
+            sessionBasePrompt.set(input.sessionID, result.system)
           }
         }
       } catch (e: any) {
