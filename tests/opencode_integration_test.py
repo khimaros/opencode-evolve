@@ -846,6 +846,162 @@ if abs_main:
 
 shutil.rmtree(abs_project, ignore_errors=True)
 
+# --- permission enforcement ---
+# regression test: opencode-evolve's plugin-defined tools call context.ask()
+# before execution to gate on the user's permission config. context.ask()
+# returns an Effect (lazy), so plain `await context.ask(...)` is a no-op and
+# the permission system is bypassed entirely. assert that a deny rule for a
+# hook-defined tool actually prevents execution and surfaces as an error in
+# the follow-up tool-result.
+
+perm_captured, perm_lock = [], threading.Lock()
+perm_step = [0]
+
+# first non-heartbeat tools-bearing request: emit a tool_call for note_write
+# targeting the denied pattern. any subsequent request: emit "done".
+DENIED_ARGS = '{"name":"blocked.md","content":"should not be written"}'
+def sse_note_write_call(args):
+    return (
+        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
+        '"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,'
+        '"id":"call_1","type":"function","function":{"name":"hello_note_write",'
+        f'"arguments":{json.dumps(args)}}}}}]}}}}]}}\n\n'
+        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
+        '"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],'
+        '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+        'data: [DONE]\n\n'
+    ).encode()
+
+class PermHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"object":"list","data":[]}')
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"_raw": raw.decode("utf-8", "replace")}
+        with perm_lock:
+            perm_captured.append({"path": self.path, "body": body})
+            is_tools_req = ("chat/completions" in self.path and body.get("tools")
+                            and not is_heartbeat_request(body))
+            if is_tools_req:
+                perm_step[0] += 1
+                step = perm_step[0]
+            else:
+                step = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(sse_note_write_call(DENIED_ARGS) if step == 1 else SSE_DONE)
+
+perm_port = free_port()
+perm_server = ThreadingHTTPServer(("127.0.0.1", perm_port), PermHandler)
+threading.Thread(target=perm_server.serve_forever, daemon=True).start()
+perm_base = f"http://127.0.0.1:{perm_port}/v1"
+
+perm_project = Path(tempfile.mkdtemp(prefix="evolve-perm-test-"))
+shutil.copytree(hello_src, perm_project / "project", dirs_exist_ok=False)
+perm_dir = perm_project / "project"
+(perm_dir / "hooks" / "evolve.py").chmod(0o755)
+
+# deny hello_note_write for the specific target; anything else allowed.
+perm_config = {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {"mock": {
+        "name": "Mock", "options": {"apiKey": "test", "baseURL": perm_base},
+        "models": {"mock": {"name": "Mock Model"}},
+    }},
+    "model": "mock/mock",
+    "small_model": "mock/mock",
+    "plugin": [plugin_path.as_uri()],
+    "permission": {
+        "hello_note_write": {
+            "*": "allow",
+            "blocked.md": "deny",
+        },
+    },
+}
+(perm_dir / "opencode.json").write_text(json.dumps(perm_config, indent=2))
+
+perm_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(perm_dir),
+            "EVOLVE_HEARTBEAT_MS": "999999"}
+
+perm_proc = subprocess.Popen(
+    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "write a note to blocked.md"],
+    cwd=str(perm_dir), env=perm_env,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+
+# wait for the follow-up tools-bearing request (carrying the tool-result)
+perm_deadline = time.time() + 60
+perm_followup = None
+while time.time() < perm_deadline:
+    with perm_lock:
+        tools_reqs = [c for c in perm_captured
+                      if "chat/completions" in c["path"] and c["body"].get("tools")
+                      and not is_heartbeat_request(c["body"])]
+        if len(tools_reqs) >= 2:
+            perm_followup = tools_reqs[1]
+            break
+    if perm_proc.poll() is not None:
+        break
+    time.sleep(0.2)
+
+if perm_proc.poll() is None:
+    perm_proc.terminate()
+try:
+    perm_stdout, perm_stderr = perm_proc.communicate(timeout=15)
+except subprocess.TimeoutExpired:
+    perm_proc.kill()
+    perm_stdout, perm_stderr = perm_proc.communicate()
+perm_server.shutdown()
+
+(ARTIFACTS / "opencode_permission.stdout.log").write_text(perm_stdout or "")
+(ARTIFACTS / "opencode_permission.stderr.log").write_text(perm_stderr or "")
+(ARTIFACTS / "opencode_permission.captured.json").write_text(
+    json.dumps(perm_captured, indent=2, default=str))
+
+# the denied file must NOT have been written — the permission check must
+# fire BEFORE the tool's side effects run.
+blocked_path = perm_dir / "traits" / "blocked.md"
+check("permission: denied tool did not create file",
+      not blocked_path.exists(),
+      f"blocked.md exists at {blocked_path} despite deny rule — "
+      f"permission check was bypassed")
+
+check("permission: follow-up chat/completions captured", perm_followup is not None,
+      f"captured: {len(perm_captured)} reqs")
+
+if perm_followup:
+    msgs = perm_followup["body"].get("messages", [])
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    tool_text = " ".join(
+        (m.get("content") if isinstance(m.get("content"), str)
+         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
+        for m in tool_msgs
+    )
+    check("permission: tool-result message present",
+          len(tool_msgs) > 0, f"roles: {[m.get('role') for m in msgs]}")
+    # successful write returns "wrote blocked.md"; denial must not.
+    check("permission: tool-result does not report a successful write",
+          "wrote blocked.md" not in tool_text,
+          f"tool executed despite deny rule; tool_text: {tool_text[:400]}")
+    # denial surfaces as an error; accept any of these markers (opencode's
+    # DeniedError message + the plugin's `tool error:` wrapper).
+    err_markers = ("denied", "permission", "rule which prevents", "tool error")
+    check("permission: tool-result carries a denial error",
+          any(mk in tool_text.lower() for mk in err_markers),
+          f"tool_text: {tool_text[:400]}")
+
+shutil.rmtree(perm_project, ignore_errors=True)
+
 # --- cleanup ---
 
 shutil.rmtree(workdir, ignore_errors=True)

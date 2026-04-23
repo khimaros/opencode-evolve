@@ -4,6 +4,13 @@
   "description": "self-modifying hook plugin for opencode — agents evolve their own behavior at runtime",
   "main": "src/index.ts",
   "type": "module",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.14.17",
+    "effect": "4.0.0-beta.48"
+  },
+  "bundledDependencies": [
+    "effect"
+  ],
   "devDependencies": {
     "@types/node": "^25.3.0",
     "typescript": "^5.9.3"
