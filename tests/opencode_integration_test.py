@@ -17,12 +17,16 @@ strategy:
 """
 
 import json, os, shlex, shutil, socket, subprocess, sys, tempfile, threading, time
+import urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = PROJECT_ROOT / "tests" / ".artifacts"
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
+
+sys.path.insert(0, str(PROJECT_ROOT / "tests"))
+from mock_openai import MockOpenAIServer, SSE_RESPONSE, is_heartbeat_request  # noqa: E402
 
 # opencode binary selection. this test asserts opencode-side fixes (zod
 # cross-instance metadata, enum validation) that the upstream npm release
@@ -64,80 +68,15 @@ def check(desc, ok, detail=""):
             print(f"  {detail}")
 
 # --- mock openai-compatible server ---
-
-captured = []
-capture_lock = threading.Lock()
-
-# stall the first build request long enough for at least one heartbeat tick
-# to fire inside the still-alive opencode process. heartbeat requests bypass
-# the stall so they can complete and be captured.
+# the main scenario uses MockOpenAIServer (shared with pi-evolve). later
+# scenarios in this file have specialized handlers and remain inline.
 HEARTBEAT_MS = 500
 STALL_SECONDS = 5
-stalled_once = False
-
-def is_heartbeat_request(body):
-    for m in body.get("messages", []) or []:
-        c = m.get("content")
-        if isinstance(c, str) and "[heartbeat]" in c:
-            return True
-        if isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict) and "[heartbeat]" in (p.get("text") or ""):
-                    return True
-    return False
-
-SSE_RESPONSE = (
-    'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
-    '"choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
-    'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
-    '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
-    '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
-    'data: [DONE]\n\n'
-).encode()
-
-class MockHandler(BaseHTTPRequestHandler):
-    def log_message(self, *_): pass
-
-    def do_POST(self):
-        length = int(self.headers.get("content-length", "0"))
-        raw = self.rfile.read(length)
-        try:
-            body = json.loads(raw)
-        except Exception:
-            body = {"_raw": raw.decode("utf-8", "replace")}
-        with capture_lock:
-            captured.append({"path": self.path, "headers": dict(self.headers), "body": body})
-        global stalled_once
-        if (not stalled_once
-                and "chat/completions" in self.path
-                and body.get("tools")
-                and not is_heartbeat_request(body)):
-            stalled_once = True
-            time.sleep(STALL_SECONDS)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(SSE_RESPONSE)
-
-    def do_GET(self):
-        # some providers probe /models; return empty list
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"object":"list","data":[]}')
 
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-def start_mock():
-    port = free_port()
-    server = ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    return server, port
 
 # --- build plugin ---
 
@@ -165,8 +104,11 @@ evolve_workspace = project_dir
 hook_file = evolve_workspace / "hooks" / "evolve.py"
 hook_file.chmod(0o755)
 
-server, port = start_mock()
-base_url = f"http://127.0.0.1:{port}/v1"
+mock = MockOpenAIServer(stall_first_with_tools=True, stall_seconds=STALL_SECONDS)
+mock.start()
+base_url = mock.base_url
+captured = mock.captured
+capture_lock = mock.lock
 print(f"mock server on {base_url}")
 
 config = {
@@ -224,7 +166,7 @@ env = {
 
 print("running opencode...")
 proc = subprocess.Popen(
-    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "hello world"],
+    [*OPENCODE_CMD, "run", "--agent", "hello", "--print-logs", "--log-level", "INFO", "hello world"],
     cwd=str(project_dir),
     env=env,
     stdout=subprocess.PIPE,
@@ -275,7 +217,7 @@ except subprocess.TimeoutExpired:
 (ARTIFACTS / "opencode_integration.stdout.log").write_text(stdout or "")
 (ARTIFACTS / "opencode_integration.stderr.log").write_text(stderr or "")
 
-server.shutdown()
+mock.shutdown()
 
 check("chat/completions request captured", chat_req is not None,
       f"captured paths: {[c['path'] for c in captured]}")
@@ -657,7 +599,7 @@ rej_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(rej_dir),
            "EVOLVE_HEARTBEAT_MS": "999999"}  # disable heartbeat noise
 
 rej_proc = subprocess.Popen(
-    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "write a note"],
+    [*OPENCODE_CMD, "run", "--agent", "hello", "--print-logs", "--log-level", "INFO", "write a note"],
     cwd=str(rej_dir), env=rej_env,
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
 )
@@ -934,7 +876,7 @@ perm_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(perm_dir),
             "EVOLVE_HEARTBEAT_MS": "999999"}
 
 perm_proc = subprocess.Popen(
-    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "write a note to blocked.md"],
+    [*OPENCODE_CMD, "run", "--agent", "hello", "--print-logs", "--log-level", "INFO", "write a note to blocked.md"],
     cwd=str(perm_dir), env=perm_env,
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
 )
@@ -1001,6 +943,242 @@ if perm_followup:
           f"tool_text: {tool_text[:400]}")
 
 shutil.rmtree(perm_project, ignore_errors=True)
+
+# --- compaction: verify KV cache prefix is preserved ---
+# the compaction agent differs from the chat agent, so without the plugin's
+# sessionBasePrompt cache the system prompt would diverge and invalidate the
+# KV cache at token 0. assert that the compaction request's system messages
+# are byte-identical to the preceding chat request's, and the message history
+# is a true prefix — only the final user turn differs (the compaction prompt).
+
+COMPACT_SENTINEL = "EVOLVE_COMPACTION_SENTINEL_ABCDEFG"
+
+cmp_captured, cmp_lock = [], threading.Lock()
+class CompactHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"object":"list","data":[]}')
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"_raw": raw.decode("utf-8", "replace")}
+        with cmp_lock:
+            cmp_captured.append({"path": self.path, "body": body})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(SSE_RESPONSE)
+
+cmp_port = free_port()
+cmp_server = ThreadingHTTPServer(("127.0.0.1", cmp_port), CompactHandler)
+threading.Thread(target=cmp_server.serve_forever, daemon=True).start()
+cmp_base = f"http://127.0.0.1:{cmp_port}/v1"
+
+cmp_project = Path(tempfile.mkdtemp(prefix="evolve-compact-test-"))
+shutil.copytree(hello_src, cmp_project / "project", dirs_exist_ok=False)
+cmp_dir = cmp_project / "project"
+(cmp_dir / "hooks" / "evolve.py").chmod(0o755)
+# distinctive sentinel in the compaction prompt — pinpoints exactly where it
+# ends up in the outgoing request
+(cmp_dir / "prompts" / "compaction.md").write_text(COMPACT_SENTINEL + "\n")
+
+cmp_config = {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {"mock": {
+        "name": "Mock", "options": {"apiKey": "test", "baseURL": cmp_base},
+        "models": {"mock": {"name": "Mock Model"}},
+    }},
+    "model": "mock/mock",
+    "small_model": "mock/mock",
+    "plugin": [plugin_path.as_uri()],
+}
+(cmp_dir / "opencode.json").write_text(json.dumps(cmp_config, indent=2))
+
+# fresh fake_home so opencode server state is isolated from earlier blocks
+cmp_home = Path(tempfile.mkdtemp(prefix="evolve-compact-home-"))
+for sub in (".config/opencode", ".local/share/opencode",
+            ".cache/opencode", ".local/state/opencode"):
+    (cmp_home / sub).mkdir(parents=True, exist_ok=True)
+
+cmp_env = {
+    **base_env,
+    "HOME": str(cmp_home),
+    "XDG_CONFIG_HOME": str(cmp_home / ".config"),
+    "XDG_DATA_HOME": str(cmp_home / ".local/share"),
+    "XDG_CACHE_HOME": str(cmp_home / ".cache"),
+    "XDG_STATE_HOME": str(cmp_home / ".local/state"),
+    "OPENCODE_EVOLVE_WORKSPACE": str(cmp_dir),
+    "EVOLVE_HEARTBEAT_MS": "999999",  # no heartbeat noise
+    "OPENAI_API_KEY": "test",
+    "CI": "1",
+}
+
+serve_port = free_port()
+print(f"starting opencode serve on port {serve_port}...")
+cmp_proc = subprocess.Popen(
+    [*OPENCODE_CMD, "serve", "--port", str(serve_port), "--hostname", "127.0.0.1"],
+    cwd=str(cmp_dir), env=cmp_env,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+
+# poll the port until opencode accepts connections (or process dies)
+serve_url = f"http://127.0.0.1:{serve_port}"
+ready = False
+ready_deadline = time.time() + 30
+while time.time() < ready_deadline:
+    if cmp_proc.poll() is not None:
+        break
+    try:
+        with socket.create_connection(("127.0.0.1", serve_port), timeout=0.5):
+            ready = True
+            break
+    except OSError:
+        time.sleep(0.2)
+
+check("compaction: opencode serve is listening", ready,
+      "process exited early; see opencode_compaction.*.log")
+
+def _http_json(method, path, body=None, timeout=60):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(serve_url + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        txt = resp.read().decode("utf-8", "replace")
+    return json.loads(txt) if txt else None
+
+session_id = None
+chat_ok = summarize_ok = False
+cmp_err = None
+
+if ready:
+    try:
+        session = _http_json("POST", "/session", {})
+        session_id = session.get("id")
+    except Exception as e:
+        cmp_err = f"session create: {e}"
+    check("compaction: session created", bool(session_id), f"err: {cmp_err}")
+
+if session_id:
+    try:
+        _http_json("POST", f"/session/{session_id}/message",
+                   {"agent": "hello",
+                    "parts": [{"type": "text", "text": "hello world"}]})
+        chat_ok = True
+    except Exception as e:
+        cmp_err = f"session prompt: {e}"
+    check("compaction: chat prompt succeeded", chat_ok, f"err: {cmp_err}")
+
+if chat_ok:
+    try:
+        _http_json("POST", f"/session/{session_id}/summarize",
+                   {"providerID": "mock", "modelID": "mock"})
+        summarize_ok = True
+    except Exception as e:
+        cmp_err = f"session summarize: {e}"
+    check("compaction: summarize call succeeded", summarize_ok, f"err: {cmp_err}")
+
+# shut down the server
+if cmp_proc.poll() is None:
+    cmp_proc.terminate()
+try:
+    cmp_stdout, cmp_stderr = cmp_proc.communicate(timeout=15)
+except subprocess.TimeoutExpired:
+    cmp_proc.kill()
+    cmp_stdout, cmp_stderr = cmp_proc.communicate()
+
+(ARTIFACTS / "opencode_compaction.stdout.log").write_text(cmp_stdout or "")
+(ARTIFACTS / "opencode_compaction.stderr.log").write_text(cmp_stderr or "")
+(ARTIFACTS / "opencode_compaction.captured.json").write_text(
+    json.dumps(cmp_captured, indent=2, default=str))
+
+cmp_server.shutdown()
+
+# find the chat and compaction LLM calls in the captured requests.
+# compaction discriminator: the sentinel appears in one of the messages.
+# chat discriminator: tools-bearing (main build-agent call), no sentinel.
+# (opencode also fires a title-generation call which has no tools and no sentinel.)
+def _has_sentinel(body):
+    for m in body.get("messages", []) or []:
+        c = m.get("content")
+        if isinstance(c, str) and COMPACT_SENTINEL in c:
+            return True
+        if isinstance(c, list):
+            for p in c:
+                if isinstance(p, dict) and COMPACT_SENTINEL in (p.get("text") or ""):
+                    return True
+    return False
+
+chat_cap = compact_cap = None
+with cmp_lock:
+    for c in cmp_captured:
+        if "chat/completions" not in c["path"]:
+            continue
+        body = c["body"]
+        if _has_sentinel(body):
+            compact_cap = compact_cap or c
+        elif body.get("tools"):
+            chat_cap = c  # latest tools-bearing non-compaction wins
+
+check("compaction: chat request captured", chat_cap is not None,
+      f"captured paths: {[x['path'] for x in cmp_captured]}")
+check("compaction: compaction request captured (found sentinel)", compact_cap is not None,
+      f"captured paths: {[x['path'] for x in cmp_captured]}")
+
+if chat_cap and compact_cap:
+    (ARTIFACTS / "opencode_compaction.chat_request.json").write_text(
+        json.dumps(chat_cap, indent=2, default=str))
+    (ARTIFACTS / "opencode_compaction.compaction_request.json").write_text(
+        json.dumps(compact_cap, indent=2, default=str))
+
+    chat_msgs = chat_cap["body"].get("messages", [])
+    cmp_msgs = compact_cap["body"].get("messages", [])
+
+    chat_sys = [m for m in chat_msgs if m.get("role") == "system"]
+    cmp_sys = [m for m in cmp_msgs if m.get("role") == "system"]
+    chat_sys_text = "\n".join(
+        (m["content"] if isinstance(m.get("content"), str)
+         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
+        for m in chat_sys)
+    # proves the marker-gated mutate_request ran on the chat turn — without
+    # the gate firing, opencode's built-in agent prompt would be in system[0]
+    # instead of hello's composed preamble.
+    check("compaction: chat system is hello's composed prompt (gate fired)",
+          expected_preamble in chat_sys_text,
+          f"hello preamble missing from chat system; got: {chat_sys_text[:300]}")
+    check("compaction: system messages byte-identical to chat (KV cache stable)",
+          chat_sys == cmp_sys,
+          f"chat sys len={sum(len(str(m.get('content'))) for m in chat_sys)}; "
+          f"compaction sys len={sum(len(str(m.get('content'))) for m in cmp_sys)}")
+
+    # compaction = chat history + one new user turn carrying the compaction
+    # prompt. the prefix up to the new turn must be byte-identical.
+    check("compaction: history prefix byte-identical to chat (KV cache stable)",
+          len(cmp_msgs) >= len(chat_msgs) + 1 and cmp_msgs[:len(chat_msgs)] == chat_msgs,
+          f"chat msgs={len(chat_msgs)}, compaction msgs={len(cmp_msgs)}")
+
+    last = cmp_msgs[-1] if cmp_msgs else {}
+    last_text = (last.get("content") if isinstance(last.get("content"), str)
+                 else "".join(p.get("text","") for p in (last.get("content") or []) if isinstance(p, dict)))
+    check("compaction: last message is user turn carrying the compaction prompt",
+          last.get("role") == "user" and COMPACT_SENTINEL in last_text,
+          f"last role={last.get('role')}, text[:120]={last_text[:120]}")
+
+    check("compaction: sentinel absent from chat request",
+          not _has_sentinel(chat_cap["body"]),
+          "compaction prompt leaked into chat request — check mutate_request plumbing")
+    check("compaction: sentinel absent from compaction prefix (only in final user turn)",
+          not _has_sentinel({"messages": cmp_msgs[:-1]}),
+          "compaction prompt appears outside the final user turn")
+
+shutil.rmtree(cmp_project, ignore_errors=True)
+shutil.rmtree(cmp_home, ignore_errors=True)
 
 # --- cleanup ---
 

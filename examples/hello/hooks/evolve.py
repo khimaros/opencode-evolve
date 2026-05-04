@@ -8,6 +8,11 @@ from typing import Annotated, TypedDict, get_type_hints
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 NOTES = WORKSPACE / "traits"
+# gate mutate_request on this marker so side calls (title generation,
+# subagents) don't overwrite opencode's system with hello's composition.
+# the marker lives in agent/hello.md and is stripped by mutate_request itself,
+# so it never reaches the LLM.
+AGENT_MARKER = "<~ HELLO AGENT MARKER ~>"
 
 class HookResult(TypedDict, total=False):
     system: list[str]
@@ -172,6 +177,12 @@ def discover(ctx: dict) -> HookResult:
 
 @hook
 def mutate_request(ctx: dict) -> HookResult:
+    # gate on AGENT_MARKER so only calls on hello-agent sessions populate the
+    # sessionBasePrompt cache; title-generation and subagent calls abstain.
+    system = ctx.get("system")
+    if system is not None and not any(AGENT_MARKER in s for s in system):
+        debug("no agent marker, skipping")
+        return {}
     debug(f"notes: {', '.join(note_names())}")
     # hello appends a notes list and env block; preamble/chat come from
     # ctx.prompts (the evolve prompt contract).

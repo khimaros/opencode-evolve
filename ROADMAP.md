@@ -4,6 +4,8 @@
 
 ## done
 
+- [x] sibling project `pi-evolve` at `../pi-evolve/` — first cut of pi-coding-agent extension implementing HOOK_PROTOCOL v1; examples/ and tests/ symlinked to opencode-evolve
+- [x] extract host-neutral HOOK_PROTOCOL.md spec from README so other agent harnesses (e.g. pi) can implement the same hook contract
 - [x] tighten integration test: assert build-request and heartbeat system prompts match the exact content the hello example should produce (preamble + stage + env); apply heartbeat hook's returned system prompt to the heartbeat session
 
 - [x] extend opencode integration test to cover the heartbeat flow (stall the build request so a heartbeat tick fires, then assert on the captured heartbeat chat/completions)
