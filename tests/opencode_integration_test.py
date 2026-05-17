@@ -940,12 +940,19 @@ if perm_followup:
     check("permission: tool-result does not report a successful write",
           "wrote blocked.md" not in tool_text,
           f"tool executed despite deny rule; tool_text: {tool_text[:400]}")
-    # denial surfaces as an error; accept any of these markers (opencode's
-    # DeniedError message + the plugin's `tool error:` wrapper).
-    err_markers = ("denied", "permission", "rule which prevents", "tool error")
-    check("permission: tool-result carries a denial error",
-          any(mk in tool_text.lower() for mk in err_markers),
+    # denial must surface opencode's DeniedError wording — not a generic
+    # exception string. opencode's permission system uses the message
+    # "rule which prevents you from using this specific tool call".
+    check("permission: tool-result carries opencode's denial wording",
+          "rule which prevents" in tool_text.lower(),
           f"tool_text: {tool_text[:400]}")
+    # regression guard: if askPermission isn't properly bound to opencode's
+    # Effect context (InstanceRef missing), the denial path collapses into a
+    # plain "tool error: InstanceRef not provided" — which we'd otherwise
+    # mistake for a legitimate denial. fail loudly instead.
+    check("permission: tool-result does not leak InstanceRef defect",
+          "instanceref" not in tool_text.lower(),
+          f"context.ask plumbing is broken; tool_text: {tool_text[:400]}")
 
 shutil.rmtree(perm_project, ignore_errors=True)
 

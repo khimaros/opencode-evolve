@@ -13,12 +13,22 @@ import { parseHookOutput, mergeResults, toolOutputPreview } from './hook'
 import { formatDatetime } from './datetime'
 import { safePath, existingPath, discoverHookPaths } from './path'
 import { permissionPatterns } from './permission'
-import { Effect } from 'effect'
+import { Effect, Fiber } from 'effect'
 
 // context.ask returns an Effect (lazy) — awaiting it directly is a no-op that
 // silently bypasses the permission system. always run it as a Promise.
+//
+// `context.ask` requires InstanceRef (opencode's per-instance Effect service);
+// since opencode commit 0c9cfe923 removed the AsyncLocalStorage fallback,
+// `Effect.runPromise` starts with an empty context and dies with
+// "InstanceRef not provided". opencode calls our `execute` via
+// `Effect.promise(() => def.execute(...))`, so the *synchronous* prefix of
+// `execute` still runs inside opencode's fiber — we capture that fiber's
+// context here and re-attach it before running the effect.
 async function askPermission(context: any, input: { permission: string; patterns: string[]; always: string[]; metadata: Record<string, any> }) {
-  await Effect.runPromise(context.ask(input))
+  const fiber = Fiber.getCurrent()
+  const eff = fiber ? Effect.provide(context.ask(input), fiber.context) : context.ask(input)
+  await Effect.runPromise(eff)
 }
 
 const execFileAsync = promisify(execFile)
