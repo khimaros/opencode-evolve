@@ -769,6 +769,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
     },
   })
 
+  if (CONFIG.dynamic_tools) {
   tools['evolve_tool_list'] = tool({
     description: `list all registered hook tools with descriptions and parameters`,
     args: {},
@@ -819,6 +820,7 @@ async function discoverTools(client: any): Promise<Record<string, ReturnType<typ
       return `unknown tool: ${name}`
     },
   })
+  }
 
   return tools
 }

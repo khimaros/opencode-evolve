@@ -100,7 +100,7 @@ shutil.copytree(hello_src, workdir / "project")
 project_dir = workdir / "project"
 evolve_workspace = project_dir
 # ensure hook is executable after copy
-hook_file = evolve_workspace / "hooks" / "evolve.py"
+hook_file = evolve_workspace / "hooks" / "hello.py"
 hook_file.chmod(0o755)
 
 mock = MockOpenAIServer(stall_first_with_tools=True, stall_seconds=STALL_SECONDS)
@@ -252,7 +252,7 @@ check("system prompt non-empty", len(system_text) > 100, f"len={len(system_text)
 # hello's mutate_request fully replaces opencode's system prompt with
 # preamble.md + chat.md + (optional notes line) + <env> block. assert each
 # piece verbatim from the hello example so drift in either the prompt files
-# or the composition logic in hooks/evolve.py is caught here.
+# or the composition logic in hooks/hello.py is caught here.
 hello_prompts = PROJECT_ROOT / "examples" / "hello" / "prompts"
 expected_preamble = (hello_prompts / "preamble.md").read_text().strip()
 expected_chat = (hello_prompts / "chat.md").read_text().strip()
@@ -592,7 +592,7 @@ rej_base = f"http://127.0.0.1:{rej_port}/v1"
 rej_project = Path(tempfile.mkdtemp(prefix="evolve-rej-test-"))
 shutil.copytree(hello_src, rej_project / "project", dirs_exist_ok=False)
 rej_dir = rej_project / "project"
-(rej_dir / "hooks" / "evolve.py").chmod(0o755)
+(rej_dir / "hooks" / "hello.py").chmod(0o755)
 rej_config = dict(config)
 rej_config["provider"] = {"mock": {
     "name": "Mock", "options": {"apiKey": "test", "baseURL": rej_base},
@@ -713,7 +713,7 @@ abs_dir = abs_project / "project"
 (abs_dir / "prompts").mkdir()
 (abs_dir / "prompts" / "preamble.md").write_text(ABSTAIN_PREAMBLE)
 (abs_dir / "prompts" / "chat.md").write_text(ABSTAIN_CHAT)
-abs_hook = abs_dir / "hooks" / "evolve.py"
+abs_hook = abs_dir / "hooks" / "hello.py"
 abs_hook.write_text(
     "#!/usr/bin/env python3\n"
     "import json, sys\n"
@@ -856,7 +856,7 @@ perm_base = f"http://127.0.0.1:{perm_port}/v1"
 perm_project = Path(tempfile.mkdtemp(prefix="evolve-perm-test-"))
 shutil.copytree(hello_src, perm_project / "project", dirs_exist_ok=False)
 perm_dir = perm_project / "project"
-(perm_dir / "hooks" / "evolve.py").chmod(0o755)
+(perm_dir / "hooks" / "hello.py").chmod(0o755)
 
 # deny hello_note_write for the specific target; anything else allowed.
 perm_config = {
@@ -996,7 +996,7 @@ cmp_base = f"http://127.0.0.1:{cmp_port}/v1"
 cmp_project = Path(tempfile.mkdtemp(prefix="evolve-compact-test-"))
 shutil.copytree(hello_src, cmp_project / "project", dirs_exist_ok=False)
 cmp_dir = cmp_project / "project"
-(cmp_dir / "hooks" / "evolve.py").chmod(0o755)
+(cmp_dir / "hooks" / "hello.py").chmod(0o755)
 # distinctive sentinel in the compaction prompt — pinpoints exactly where it
 # ends up in the outgoing request
 (cmp_dir / "prompts" / "compaction.md").write_text(COMPACT_SENTINEL + "\n")

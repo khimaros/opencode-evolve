@@ -81,8 +81,8 @@ try:
     # copy hook into temp workspace
     for d in ("hooks", "traits", "prompts"):
         os.makedirs(os.path.join(tmp, d))
-    shutil.copy2(os.path.join(workspace, "hooks", "evolve.py"), os.path.join(tmp, "hooks", "evolve.py"))
-    hook = os.path.join(tmp, "hooks", "evolve.py")
+    shutil.copy2(os.path.join(workspace, "hooks", "hello.py"), os.path.join(tmp, "hooks", "hello.py"))
+    hook = os.path.join(tmp, "hooks", "hello.py")
     for name, content in [("preamble.md", "preamble"), ("chat.md", "chat"),
                           ("heartbeat.md", "heartbeat"), ("compaction.md", "compaction")]:
         open(os.path.join(tmp, "prompts", name), "w").write(content)

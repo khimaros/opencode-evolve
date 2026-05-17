@@ -281,7 +281,7 @@ def execute_tool(ctx: dict) -> HookResult:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "usage: evolve.py <hook_name>"}))
+        print(json.dumps({"error": "usage: hello.py <hook_name>"}))
         sys.exit(1)
     h = HOOKS.get(sys.argv[1])
     if not h:

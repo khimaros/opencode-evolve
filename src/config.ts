@@ -20,6 +20,11 @@ export interface EvolveConfig {
   // gates which paths reach the hook. set to "" (empty) to always fire.
   // overridable via EVOLVE_AGENT_MARKER.
   agent_marker: string
+  // expose the dynamic tool-dispatch surface (evolve_tool_list, evolve_tool_invoke).
+  // set false to register only the hook-defined static tools — useful when the
+  // model is reliable enough to call hook tools by name and the dynamic
+  // dispatcher just bloats the tool list. overridable via EVOLVE_DYNAMIC_TOOLS.
+  dynamic_tools: boolean
 }
 
 export const DEFAULTS: EvolveConfig = {
@@ -33,6 +38,7 @@ export const DEFAULTS: EvolveConfig = {
   heartbeat_cleanup_tokens: null,
   heartbeat_skip_active: true,
   agent_marker: '<~ EVOLVE AGENT MARKER ~>',
+  dynamic_tools: true,
 }
 
 // --- per-hook registration data returned by discover ---
