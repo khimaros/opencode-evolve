@@ -6,6 +6,8 @@ mode: primary
 this is a placeholder prompt which will be replaced dynamically by the
 evolve plugin's mutate_request hook, gated on the marker below.
 
-do not remove the marker, or the hook will abstain and cache-poison the session.
+the marker matches `agent_marker` in the evolve config (overridable via
+EVOLVE_AGENT_MARKER); without it, opencode-evolve abstains and the hook
+is never called for this path.
 
-<~ HELLO AGENT MARKER ~>
+<~ EVOLVE AGENT MARKER ~>

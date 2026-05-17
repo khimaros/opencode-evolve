@@ -13,6 +13,13 @@ export interface EvolveConfig {
   heartbeat_cleanup_count: number | null
   heartbeat_cleanup_tokens: number | null
   heartbeat_skip_active: boolean
+  // marker that must appear in opencode's pre-composed system prompt for
+  // mutate_request hooks to fire. opencode's system.transform fires on
+  // multiple paths (title generation, subagents, main chat); placing this
+  // marker in the agent body of the agents you want hooks to act on
+  // gates which paths reach the hook. set to "" (empty) to always fire.
+  // overridable via EVOLVE_AGENT_MARKER.
+  agent_marker: string
 }
 
 export const DEFAULTS: EvolveConfig = {
@@ -25,6 +32,7 @@ export const DEFAULTS: EvolveConfig = {
   heartbeat_cleanup_count: null,
   heartbeat_cleanup_tokens: null,
   heartbeat_skip_active: true,
+  agent_marker: '<~ EVOLVE AGENT MARKER ~>',
 }
 
 // --- per-hook registration data returned by discover ---

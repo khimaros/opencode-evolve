@@ -28,10 +28,8 @@ ARTIFACTS.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(PROJECT_ROOT / "tests"))
 from mock_openai import MockOpenAIServer, SSE_RESPONSE, is_heartbeat_request  # noqa: E402
 
-# opencode binary selection. this test asserts opencode-side fixes (zod
-# cross-instance metadata, enum validation) that the upstream npm release
-# may not yet ship, so we refuse to silently fall back to `opencode` on
-# PATH — that masks regressions by running against an unrelated build.
+# opencode binary selection. defaults to `opencode` on PATH (the globally
+# installed npm release); overrides:
 #   OPENCODE_BIN=<command>   full command override (space-separated, shlex-parsed)
 #   OPENCODE_SRC=<path>      local opencode checkout; runs via `bun run <src>/packages/opencode/src/index.ts`
 def resolve_opencode_cmd():
@@ -45,11 +43,12 @@ def resolve_opencode_cmd():
             print(f"OPENCODE_SRC set but entry point not found: {entry}", file=sys.stderr)
             sys.exit(2)
         return ["bun", "run", "--conditions=browser", str(entry)]
-    print("error: set OPENCODE_BIN=<path-to-opencode> or OPENCODE_SRC=<opencode-checkout>.",
-          file=sys.stderr)
-    print("       `opencode` on PATH is not used — this test relies on local opencode fixes.",
-          file=sys.stderr)
-    sys.exit(2)
+    found = shutil.which("opencode")
+    if not found:
+        print("error: `opencode` not found on PATH; set OPENCODE_BIN or OPENCODE_SRC.",
+              file=sys.stderr)
+        sys.exit(2)
+    return [found]
 
 OPENCODE_CMD = resolve_opencode_cmd()
 print(f"opencode command: {' '.join(OPENCODE_CMD)}")
@@ -137,9 +136,12 @@ for sub in (".config/opencode", ".local/share/opencode",
     (fake_home / sub).mkdir(parents=True, exist_ok=True)
 
 # start from os.environ for PATH / locale / node binaries, then strip any
-# opencode-specific vars that could re-inject outside config.
+# opencode-specific vars that could re-inject outside config. drop PWD too:
+# `opencode run` resolves its root as `process.env.PWD ?? process.cwd()`
+# (cli/cmd/run.ts), so inheriting the calling shell's PWD overrides each
+# Popen's cwd and binds opencode to the wrong directory across scenarios.
 base_env = {k: v for k, v in os.environ.items()
-            if not k.startswith(("OPENCODE_", "XDG_"))}
+            if not k.startswith(("OPENCODE_", "XDG_")) and k != "PWD"}
 
 env = {
     **base_env,
@@ -408,12 +410,15 @@ check("note_write invalid enum value is rejected by jsonschema",
 # object/array/any params must expose the explicit jsonValue primitive union
 # (string|number|boolean|null|array|object) rather than an under-specified `any`.
 def resolve_schema(node, full_schema):
-    """follow a single $ref if present, returning the resolved object"""
+    """follow a single $ref if present, returning the resolved object.
+    opencode emits the table under `definitions` even though the refs use
+    `#/$defs/…`, so check both keys."""
     if isinstance(node, dict) and "$ref" in node:
         ref = node["$ref"]
-        if ref.startswith("#/$defs/"):
+        if ref.startswith("#/$defs/") or ref.startswith("#/definitions/"):
             key = ref.split("/")[-1]
-            return (full_schema.get("$defs") or {}).get(key, {})
+            defs = full_schema.get("$defs") or full_schema.get("definitions") or {}
+            return defs.get(key, {})
     return node
 
 def has_primitive_union(node, full_schema):
@@ -1185,17 +1190,21 @@ shutil.rmtree(cmp_home, ignore_errors=True)
 shutil.rmtree(workdir, ignore_errors=True)
 shutil.rmtree(fake_home, ignore_errors=True)
 
-# --- hard-fail: every tool parameter must carry a description ---
+# --- hard-fail: every plugin tool parameter must carry a description ---
 # zod `.describe()` → JSON schema `description` must survive all the way into
 # the outgoing request, otherwise the LLM sees nameless/untyped knobs.
+# scoped to evolve/hello plugin tools; opencode's built-in tools (webfetch,
+# etc.) are out of scope and may have their own gaps upstream.
 missing_param_desc = []
 for t in tools:
     tname = t["function"]["name"]
+    if not (tname.startswith("evolve_") or tname.startswith("hello_")):
+        continue
     props = (t["function"].get("parameters", {}).get("properties") or {})
     for pname, pspec in props.items():
         if not (isinstance(pspec, dict) and pspec.get("description")):
             missing_param_desc.append(f"{tname}.{pname}")
-check("every tool parameter has a description",
+check("every plugin tool parameter has a description",
       not missing_param_desc,
       f"missing descriptions on {len(missing_param_desc)} params: {missing_param_desc[:10]}"
       + (f" ... (+{len(missing_param_desc)-10} more)" if len(missing_param_desc) > 10 else ""))

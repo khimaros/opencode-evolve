@@ -74,6 +74,8 @@ with a corresponding agent file at `agents/evolve.md`.
 
 ## hook protocol
 
+opencode-evolve implements the [harness control protocol](https://github.com/khimaros/hcp-spec/); the section below documents the workspace conventions and additional stages layered on top. identical hook scripts run unchanged against [pi-evolve](https://github.com/khimaros/pi-evolve) and [airun](https://github.com/khimaros/airun).
+
 all executable files in `hooks/` are autodiscovered and called as subprocesses (alphabetical order, files starting with `.` or `__` are ignored):
 
 ```

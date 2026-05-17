@@ -32,7 +32,14 @@ const CONFIG = loadConfig(WORKSPACE)
 const STATE_PATH = path.join(WORKSPACE, 'state', 'evolve.json')
 const LOG_PREFIX = '[evolve]'
 // observational hooks — failure should not trigger recover cascade
-const NO_RECOVER_HOOKS = new Set(['tool_before', 'tool_after', 'observe_message', 'format_notification', 'idle', 'compacting'])
+// stages whose failure triggers a recover cascade. whitelist (not
+// blacklist) so new stages opt in explicitly — recover re-enters the
+// LLM with a synthetic system+user, so the default for any observational
+// stage must be "no cascade". current members feed text back into the
+// request: mutate_request composes the system prompt; heartbeat injects
+// an autonomous user turn. before_stop is excluded deliberately —
+// recover-induced re-entry on a loop-termination stage is a footgun.
+const RECOVER_HOOKS = new Set(['mutate_request', 'heartbeat'])
 
 // prompt contract: evolve owns prompts/ and injects stage defaults when a hook
 // returns no system/user/prompt for that stage. each entry names a stage role
@@ -214,7 +221,8 @@ async function callSingleHook(hookPath: string, name: string, context: object, s
   try {
     const history = sessionId ? sessionHistory.get(sessionId) || [] : undefined
     const prompts = loadPrompts()
-    const input = JSON.stringify({ hook: name, prompts, ...context, ...(history ? { history } : {}) })
+    const host = { name: 'opencode-evolve', version: 2, stages: ['discover', 'mutate_request', 'before_tool', 'after_tool', 'execute_tool', 'before_stop', 'observe_message', 'format_notification', 'heartbeat', 'compacting', 'recover'] }
+    const input = JSON.stringify({ hook: name, host, prompts, ...context, ...(history ? { history } : {}) })
     debug(`hook ${name} [${stem}] start`)
     const { stdout } = await spawnHook(hookPath, name, input)
     const ms = Date.now() - start
@@ -245,7 +253,7 @@ async function callHook(name: string, context: object, sessionId?: string): Prom
       const result = await callSingleHook(hookPath, name, context, sessionId)
       merged = mergeResults(merged, result)
     } catch (e: any) {
-      if (name !== 'recover' && !NO_RECOVER_HOOKS.has(name)) {
+      if (RECOVER_HOOKS.has(name)) {
         const recovery = await callHook('recover', { error: e.message, failed_hook: name })
         // default recover: [preamble, recover] as system, recover.md as user
         const p = loadPrompts()
@@ -943,11 +951,12 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         if (result.modified?.length) trackModified(result.modified)
         if (result.notify?.length) await sendNotifications(client, result.notify, input.sessionID)
         if (result.actions?.length) await executeActions(client, result.actions)
-        // idle continuation: when LLM gives a final response (no tool calls),
-        // ask the hook if the session should be forced to continue
+        // before_stop continuation: when LLM gives a final response (no tool
+        // calls), ask the hook if the session should be forced to continue.
+        // translates opencode's `idle` event to the canonical v2 stage name.
         const hasToolCalls = parts.some((p: any) => p.type === 'tool')
         if (!hasToolCalls) {
-          const idle = await callHook('idle', {
+          const idle = await callHook('before_stop', {
             session: { id: input.sessionID, agent: input.agent },
             answer,
           }, input.sessionID)
@@ -970,20 +979,39 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
 
     "tool.execute.before": async (input, output) => {
       debug(`tool call: ${input.tool} session=${input.sessionID} call=${input.callID} args=${JSON.stringify(output.args)}`)
-      await callHook('tool_before', {
+      const r = await callHook('before_tool', {
         session: { id: input.sessionID },
         tool: input.tool, callID: input.callID, args: output.args,
       }, input.sessionID)
+      // hook arg-mutation: replace output.args in place. (deny/result
+      // substitution are not supported here — opencode's plugin API has no
+      // way to short-circuit a tool call from the before hook; that
+      // requires upstream support.)
+      if (r?.args && typeof r.args === 'object') {
+        Object.keys(output.args).forEach(k => delete (output.args as any)[k])
+        Object.assign(output.args, r.args)
+        debug(`before_tool mutated args: ${JSON.stringify(output.args)}`)
+      }
+      if (r?.deny) {
+        debug(`before_tool returned deny: not honored on opencode (upstream-blocked)`)
+      }
     },
 
     "tool.execute.after": async (input, output) => {
       const preview = toolOutputPreview(output.output)
       debug(`tool done: ${input.tool} session=${input.sessionID} call=${input.callID} output=${preview}`)
-      await callHook('tool_after', {
+      const r = await callHook('after_tool', {
         session: { id: input.sessionID },
         tool: input.tool, callID: input.callID,
         title: output.title, output: output.output,
       }, input.sessionID)
+      // hook result-mutation: replace output.output in place. accepted
+      // both as `result` (v2 protocol name) and `output` (legacy alias).
+      const replacement = typeof r?.result === 'string' ? r.result : (typeof r?.output === 'string' ? r.output : undefined)
+      if (replacement !== undefined) {
+        output.output = replacement
+        debug(`after_tool mutated output: ${toolOutputPreview(replacement)}`)
+      }
     },
 
     "experimental.chat.messages.transform": async (input, output) => {
@@ -1003,16 +1031,33 @@ export const EvolvePlugin: Plugin = async ({ client: projectClient, directory, s
         if (cached) {
           output.system.splice(0, output.system.length, ...cached)
         } else {
+          // gate which system.transform paths reach the hook. opencode
+          // fires this hook for several paths (main chat, title generation,
+          // subagents) — only the ones whose pre-composed system carries
+          // the configured agent_marker do. set agent_marker to "" in
+          // config (or via EVOLVE_AGENT_MARKER) to disable gating and
+          // always invoke the hook.
+          const marker = CONFIG.agent_marker
+          if (marker && !output.system.some((s: string) => s.includes(marker))) {
+            debug(`mutate_request gated: agent_marker not present`)
+            return
+          }
+          // payload expansion: surface finalized system / user / model so
+          // hooks see the full request (parity with airun's mutate_request).
+          // tools is deferred — opencode's plugin API doesn't expose the
+          // tool list at system.transform.
+          const pending = pendingMessagesQueue[0] || sessionHistory.get(input.sessionID) || []
+          const lastUser = [...pending].reverse().find((m: any) => m.role === 'user')
+          const userText = lastUser?.parts
+            ?.filter((p: any) => p?.type === 'text')
+            .map((p: any) => p.text || '')
+            .join('') || ''
           const result = await callHook('mutate_request', {
             session: { id: input.sessionID },
             system: output.system,
+            user: userText,
+            model: lastModel ? `${lastModel.providerID || ''}/${lastModel.modelID || ''}` : '',
           }, input.sessionID)
-          // only apply & cache when the hook actually returned a system. empty
-          // result = abstain: leave output.system alone and don't cache. opencode
-          // calls system.transform for several non-main-chat paths per session
-          // (title generation, summarization); each carries a different prompt
-          // and not all carry whatever content the hook gates on. caching an
-          // abstain would freeze a wrong prompt for the whole session.
           if (result.system?.length) {
             output.system.splice(0, output.system.length, ...result.system)
             sessionBasePrompt.set(input.sessionID, result.system)

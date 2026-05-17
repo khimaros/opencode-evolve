@@ -8,11 +8,6 @@ from typing import Annotated, TypedDict, get_type_hints
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 NOTES = WORKSPACE / "traits"
-# gate mutate_request on this marker so side calls (title generation,
-# subagents) don't overwrite opencode's system with hello's composition.
-# the marker lives in agent/hello.md and is stripped by mutate_request itself,
-# so it never reaches the LLM.
-AGENT_MARKER = "<~ HELLO AGENT MARKER ~>"
 
 class HookResult(TypedDict, total=False):
     system: list[str]
@@ -177,15 +172,19 @@ def discover(ctx: dict) -> HookResult:
 
 @hook
 def mutate_request(ctx: dict) -> HookResult:
-    # gate on AGENT_MARKER so only calls on hello-agent sessions populate the
-    # sessionBasePrompt cache; title-generation and subagent calls abstain.
-    system = ctx.get("system")
-    if system is not None and not any(AGENT_MARKER in s for s in system):
-        debug("no agent marker, skipping")
-        return {}
+    # v2 host-capability surfacing: log host/model/user when present.
+    host = ctx.get("host") or {}
+    if host:
+        debug(f"host={host.get('name', '?')} v={host.get('version', '?')}")
+    if "model" in ctx:
+        debug(f"model={ctx.get('model') or '(none)'}")
+    if "user" in ctx:
+        debug(f"user_len={len(ctx.get('user') or '')}")
     debug(f"notes: {', '.join(note_names())}")
     # hello appends a notes list and env block; preamble/chat come from
-    # ctx.prompts (the evolve prompt contract).
+    # ctx.prompts (the evolve prompt contract). hosts that need to gate
+    # which paths reach this hook handle that themselves (see
+    # opencode-evolve's agent_marker config).
     return {"system": system_prompt(ctx.get("prompts", {}), "chat")}
 
 @hook
@@ -206,10 +205,17 @@ def observe_message(ctx: dict) -> HookResult:
     return {}
 
 @hook
-def idle(ctx: dict) -> HookResult:
+def before_stop(ctx: dict) -> HookResult:
     session = ctx.get("session", {})
     answer = ctx.get("answer", "")
     debug(f"session={session.get('id', '?')} answer_len={len(answer)}")
+    # v2: hosts that distinguish loop exit causes pass `exit_reason` and
+    # `final`. opencode/pi only fire on natural idle so they may omit
+    # both; airun always sets `final: true` (no re-entry).
+    if "exit_reason" in ctx:
+        debug(f"exit_reason={ctx.get('exit_reason')} final={ctx.get('final', False)}")
+        if ctx.get("error"):
+            debug(f"error={ctx.get('error')}")
     return {}
 
 @hook
@@ -227,11 +233,27 @@ def recover(ctx: dict) -> HookResult:
     return {"system": ["system recovery — an error occurred"], "user": "please check notes and continue"}
 
 @hook
-def tool_before(ctx: dict) -> HookResult:
+def before_tool(ctx: dict) -> HookResult:
+    # demo of v2 mutation response keys, gated on a sentinel arg so normal
+    # tool calls flow through unchanged. tools matching `_deny_me_*` are
+    # refused; tools matching `_redact_*` get their args overwritten.
+    tool = ctx.get("tool", "")
+    args = ctx.get("args", {}) or {}
+    name_arg = (args.get("name") or "")
+    if name_arg.startswith("_deny_me_"):
+        return {"deny": f"refused by hello: {name_arg}"}
+    if name_arg.startswith("_redact_"):
+        return {"args": {**args, "name": "REDACTED.md"}}
     return {}
 
 @hook
-def tool_after(ctx: dict) -> HookResult:
+def after_tool(ctx: dict) -> HookResult:
+    # demo of `result` mutation, gated on a sentinel in the result text so
+    # production output is untouched. when the tool result starts with
+    # `_replace_me`, substitute a canned reply.
+    out = ctx.get("output") or ctx.get("result") or ""
+    if isinstance(out, str) and out.startswith("_replace_me"):
+        return {"result": "REPLACED-BY-AFTER-TOOL"}
     return {}
 
 @hook

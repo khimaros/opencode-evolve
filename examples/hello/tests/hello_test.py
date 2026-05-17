@@ -175,12 +175,96 @@ try:
     check("observe_message logs session", any("session=abc" in l for l in logs))
     check("observe_message logs agent", any("agent=evolve" in l for l in logs))
 
-    # --- idle ---
+    # --- before_stop ---
 
-    r, logs, _ = call_hook(hook, "idle", {"session": {"id": "s1", "agent": "evolve"}, "answer": "hello"})
-    check("idle returns empty by default", not has_key(r, "continue"))
-    check("idle logs session", any("session=s1" in l for l in logs))
-    check("idle logs answer length", any("answer_len=5" in l for l in logs))
+    r, logs, _ = call_hook(hook, "before_stop", {"session": {"id": "s1", "agent": "evolve"}, "answer": "hello"})
+    check("before_stop returns empty by default", not has_key(r, "continue"))
+    check("before_stop logs session", any("session=s1" in l for l in logs))
+    check("before_stop logs answer length", any("answer_len=5" in l for l in logs))
+
+    # --- before_stop v2 payload (exit_reason, final, error) ---
+
+    r, logs, _ = call_hook(hook, "before_stop", {
+        "session": {"id": "s2", "agent": "evolve"}, "answer": "",
+        "exit_reason": "stop", "final": True,
+    })
+    check("before_stop logs exit_reason", any("exit_reason=stop" in l for l in logs))
+    check("before_stop logs final flag", any("final=True" in l for l in logs))
+
+    r, logs, _ = call_hook(hook, "before_stop", {
+        "session": {"id": "s3", "agent": "evolve"}, "answer": "",
+        "exit_reason": "error", "final": True, "error": "network broke",
+    })
+    check("before_stop logs error reason", any("exit_reason=error" in l for l in logs))
+    check("before_stop logs error string", any("error=network broke" in l for l in logs))
+
+    # --- mutate_request v2 payload (host capability, model, user) ---
+    # gating moved to the host (opencode-evolve agent_marker config), so
+    # the hook itself unconditionally returns a system prompt regardless
+    # of payload contents.
+
+    r, logs, _ = call_hook(hook, "mutate_request", {
+        "host": {"name": "airun", "version": 2, "stages": ["mutate_request", "before_stop"]},
+        "system": "any composed prompt here",
+        "user": "the user prompt",
+        "model": "anthropic/claude-opus-4-7",
+    })
+    check("mutate_request logs host name+version", any("host=airun v=2" in l for l in logs))
+    check("mutate_request logs model", any("model=anthropic/claude-opus-4-7" in l for l in logs))
+    check("mutate_request logs user_len", any("user_len=15" in l for l in logs))
+    check("mutate_request returns system unconditionally", has_key(r, "system"))
+
+    # any system shape works (str / list / absent)
+    for sys_payload in ("a single string", ["a", "list", "of", "strs"], None):
+        ctx = {"host": {"name": "airun", "version": 2}, "user": "x", "model": "openai/gpt"}
+        if sys_payload is not None:
+            ctx["system"] = sys_payload
+        r, _, _ = call_hook(hook, "mutate_request", ctx)
+        check(f"mutate_request returns system regardless of payload shape ({type(sys_payload).__name__})",
+              has_key(r, "system"))
+
+    # --- before_tool / after_tool mutation response keys ---
+
+    # before_tool: deny when sentinel arg matches
+    r, _, _ = call_hook(hook, "before_tool", {
+        "tool": "note_read", "callID": "c1",
+        "args": {"name": "_deny_me_secret.md"},
+    })
+    check("before_tool returns deny", r.get("deny", "").startswith("refused by hello:"),
+          f"got: {r}")
+
+    # before_tool: arg replacement
+    r, _, _ = call_hook(hook, "before_tool", {
+        "tool": "note_read", "callID": "c2",
+        "args": {"name": "_redact_secret.md"},
+    })
+    check("before_tool returns args mutation", isinstance(r.get("args"), dict))
+    check("before_tool args replaces name", r.get("args", {}).get("name") == "REDACTED.md",
+          f"got: {r.get('args')}")
+
+    # before_tool: passthrough on normal args
+    r, _, _ = call_hook(hook, "before_tool", {
+        "tool": "note_read", "callID": "c3",
+        "args": {"name": "todo.md"},
+    })
+    check("before_tool returns empty for normal args", not has_key(r, "deny") and not has_key(r, "args"),
+          f"got: {r}")
+
+    # after_tool: result substitution when output starts with sentinel
+    r, _, _ = call_hook(hook, "after_tool", {
+        "tool": "note_read", "callID": "c4",
+        "title": "", "output": "_replace_me original output here",
+    })
+    check("after_tool returns result mutation", r.get("result") == "REPLACED-BY-AFTER-TOOL",
+          f"got: {r}")
+
+    # after_tool: passthrough on normal output
+    r, _, _ = call_hook(hook, "after_tool", {
+        "tool": "note_read", "callID": "c5",
+        "title": "", "output": "buy milk",
+    })
+    check("after_tool returns empty for normal output", not has_key(r, "result"),
+          f"got: {r}")
 
     # --- compacting ---
 
@@ -317,11 +401,11 @@ try:
     })
     check("observe_message with history logs session", any("session=h1" in l for l in logs))
 
-    r, logs, _ = call_hook(hook, "idle", {
+    r, logs, _ = call_hook(hook, "before_stop", {
         "session": {"id": "h2", "agent": "evolve"}, "answer": "ok", "history": sample_history,
     })
-    check("idle with history returns ok", not has_key(r, "error"))
-    check("idle with history logs session", any("session=h2" in l for l in logs))
+    check("before_stop with history returns ok", not has_key(r, "error"))
+    check("before_stop with history logs session", any("session=h2" in l for l in logs))
 
     r, _, _ = call_hook(hook, "heartbeat", {"history": sample_history})
     check("heartbeat with history returns system", has_key(r, "system"))
@@ -337,15 +421,15 @@ try:
     })
     check("format_notification with history returns message", has_key(r, "message"))
 
-    r, _, _ = call_hook(hook, "tool_before", {
+    r, _, _ = call_hook(hook, "before_tool", {
         "session": {"id": "h3"}, "tool": "t", "callID": "c", "args": {}, "history": sample_history,
     })
-    check("tool_before with history ok", not has_key(r, "error"))
+    check("before_tool with history ok", not has_key(r, "error"))
 
-    r, _, _ = call_hook(hook, "tool_after", {
+    r, _, _ = call_hook(hook, "after_tool", {
         "session": {"id": "h3"}, "tool": "t", "callID": "c", "title": "", "output": "", "history": sample_history,
     })
-    check("tool_after with history ok", not has_key(r, "error"))
+    check("after_tool with history ok", not has_key(r, "error"))
 
     # --- unknown hook: should exit 0 with no output ---
 
