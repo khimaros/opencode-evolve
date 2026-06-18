@@ -1,7 +1,7 @@
 
-#OPENCODE_BASE := $(PWD)/../../anomalyco/opencode/
-#OPENCODE_BIN := $(OPENCODE_BASE)/packages/opencode/dist/opencode-linux-x64/bin/opencode
-OPENCODE_BIN := opencode
+OPENCODE_BASE := $(PWD)/../../anomalyco/opencode/
+OPENCODE_BIN := $(OPENCODE_BASE)/packages/opencode/dist/opencode-linux-x64/bin/opencode
+#OPENCODE_BIN := opencode
 
 build:
 	npx tsc --noEmit

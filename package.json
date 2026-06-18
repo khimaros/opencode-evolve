@@ -1,6 +1,6 @@
 {
   "name": "opencode-evolve",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "self-modifying hook plugin for opencode — agents evolve their own behavior at runtime",
   "main": "src/index.ts",
   "type": "module",
