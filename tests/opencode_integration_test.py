@@ -4,29 +4,47 @@ evolve plugin is loaded, via a mock openai-compatible server.
 
 strategy:
   1. build the plugin (dist/index.js)
-  2. spawn a local http server impersonating an openai chat-completions endpoint
+  2. spawn the fake-openai binary as a subprocess impersonating an openai
+     chat-completions endpoint
   3. write an opencode.json in a temp workspace that:
        - defines a custom provider (npm defaults to @ai-sdk/openai-compatible)
          whose baseURL points at our mock server
        - registers dist/index.js as a plugin
-       - selects mock/mock as both model and small_model
+       - selects mock/fake-model as both model and small_model
   4. run `opencode run "hello"` against that workspace
   5. assert the captured request body contains a real system prompt and the
      evolve_* tool schemas
   6. dump the full captured payload to tests/.artifacts/ for inspection
 """
 
-import json, os, shlex, shutil, socket, subprocess, sys, tempfile, threading, time
+import json, os, shlex, shutil, socket, subprocess, sys, tempfile, time
 import urllib.request, urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = PROJECT_ROOT / "tests" / ".artifacts"
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
-sys.path.insert(0, str(PROJECT_ROOT / "tests"))
-from mock_openai import MockOpenAIServer, SSE_RESPONSE, is_heartbeat_request  # noqa: E402
+# the mock is the shared, language-agnostic fake-openai binary, driven through
+# its python client on the sibling ../fake-openai checkout. the client owns the
+# spawn + admin glue; the local names below keep the scenario call sites terse.
+sys.path.insert(0, str(PROJECT_ROOT.parent / "fake-openai" / "clients" / "python"))
+import fakeopenai
+
+if not fakeopenai.available():
+    print(f"SKIP: fake-openai binary not found at {fakeopenai.BIN}; "
+          "build ../fake-openai or set FAKE_OPENAI_BIN")
+    sys.exit(0)
+
+is_heartbeat_request = fakeopenai.is_heartbeat_request
+fetch_captures = fakeopenai.captures
+program_responses = fakeopenai.program
+
+
+def start_fake_openai(*args):
+    """launch fake-openai on a free port; return (proc, base_url, admin_url)."""
+    f = fakeopenai.FakeOpenAI(*args).start()
+    return f.proc, f.base_url, f.admin_url
 
 # opencode binary selection. defaults to `opencode` on PATH (the globally
 # installed npm release); overrides:
@@ -67,8 +85,9 @@ def check(desc, ok, detail=""):
             print(f"  {detail}")
 
 # --- mock openai-compatible server ---
-# the main scenario uses MockOpenAIServer (shared with pi-evolve). later
-# scenarios in this file have specialized handlers and remain inline.
+# each scenario launches its own fake-openai subprocess; the stall scenario
+# uses --stall-first-with-tools and the tool_call scenarios program a response
+# queue with --consume-only-with-tools.
 HEARTBEAT_MS = 500
 STALL_SECONDS = 5
 
@@ -103,11 +122,8 @@ evolve_workspace = project_dir
 hook_file = evolve_workspace / "hooks" / "hello.py"
 hook_file.chmod(0o755)
 
-mock = MockOpenAIServer(stall_first_with_tools=True, stall_seconds=STALL_SECONDS)
-mock.start()
-base_url = mock.base_url
-captured = mock.captured
-capture_lock = mock.lock
+fake, base_url, admin_url = start_fake_openai(
+    "--stall-first-with-tools", "--stall-seconds", str(STALL_SECONDS))
 print(f"mock server on {base_url}")
 
 config = {
@@ -116,11 +132,11 @@ config = {
         "mock": {
             "name": "Mock",
             "options": {"apiKey": "test", "baseURL": base_url},
-            "models": {"mock": {"name": "Mock Model"}},
+            "models": {"fake-model": {"name": "Fake Model"}},
         }
     },
-    "model": "mock/mock",
-    "small_model": "mock/mock",
+    "model": "mock/fake-model",
+    "small_model": "mock/fake-model",
     "plugin": [plugin_path.as_uri()],
 }
 (project_dir / "opencode.json").write_text(json.dumps(config, indent=2))
@@ -154,7 +170,7 @@ env = {
     "OPENCODE_EVOLVE_WORKSPACE": str(evolve_workspace),
     "EVOLVE_HEARTBEAT_MS": str(HEARTBEAT_MS),
     # heartbeat tick fires before chat.message captures the model, so seed it
-    "EVOLVE_MODEL": "mock/mock",
+    "EVOLVE_MODEL": "mock/fake-model",
     # the build session is intentionally stalled — don't let heartbeat skip on it
     "EVOLVE_HEARTBEAT_SKIP_ACTIVE": "false",
     # no custom agents in the test opencode.json — use the builtin
@@ -184,27 +200,25 @@ deadline = time.time() + 90
 chat_req = None
 hb_req_seen = None
 while time.time() < deadline:
-    with capture_lock:
-        for c in captured:
-            if "chat/completions" not in c["path"]:
-                continue
-            if not c["body"].get("tools"):
-                continue
-            if is_heartbeat_request(c["body"]):
-                hb_req_seen = hb_req_seen or c
-            else:
-                chat_req = chat_req or c
+    for c in fetch_captures(admin_url):
+        if "chat/completions" not in c["path"]:
+            continue
+        if not c["body"].get("tools"):
+            continue
+        if is_heartbeat_request(c["body"]):
+            hb_req_seen = hb_req_seen or c
+        else:
+            chat_req = chat_req or c
     if chat_req and hb_req_seen:
         break
     if proc.poll() is not None:
         time.sleep(0.5)
-        with capture_lock:
-            for c in captured:
-                if "chat/completions" in c["path"] and c["body"].get("tools"):
-                    if is_heartbeat_request(c["body"]):
-                        hb_req_seen = hb_req_seen or c
-                    else:
-                        chat_req = chat_req or c
+        for c in fetch_captures(admin_url):
+            if "chat/completions" in c["path"] and c["body"].get("tools"):
+                if is_heartbeat_request(c["body"]):
+                    hb_req_seen = hb_req_seen or c
+                else:
+                    chat_req = chat_req or c
         break
     time.sleep(0.2)
 
@@ -219,7 +233,8 @@ except subprocess.TimeoutExpired:
 (ARTIFACTS / "opencode_integration.stdout.log").write_text(stdout or "")
 (ARTIFACTS / "opencode_integration.stderr.log").write_text(stderr or "")
 
-mock.shutdown()
+captured = fetch_captures(admin_url)
+fake.terminate()
 
 check("chat/completions request captured", chat_req is not None,
       f"captured paths: {[c['path'] for c in captured]}")
@@ -473,11 +488,10 @@ check("note_delete.name is required", "name" in required("hello_note_delete"))
 # and whose system prompt comes from hello's heartbeat() hook.
 
 hb_req = None
-with capture_lock:
-    for c in captured:
-        if "chat/completions" in c["path"] and is_heartbeat_request(c["body"]):
-            hb_req = c
-            break
+for c in captured:
+    if "chat/completions" in c["path"] and is_heartbeat_request(c["body"]):
+        hb_req = c
+        break
 
 check("heartbeat chat/completions request captured", hb_req is not None,
       f"captured paths: {[c['path'] for c in captured]}")
@@ -528,66 +542,18 @@ if hb_req:
 # with priority="urgent" (not in the enum). opencode should reject the args and
 # the next chat/completions request should carry a tool-result with an error.
 
-rej_captured = []
-rej_lock = threading.Lock()
-rej_step = [0]  # [0] = count of non-heartbeat tools-bearing requests seen
-
-BAD_ARGS = '{"name":"x.md","content":"y","priority":"urgent"}'
-def sse_tool_call(args):
-    return (
-        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
-        '"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,'
-        '"id":"call_1","type":"function","function":{"name":"hello_note_write",'
-        f'"arguments":{json.dumps(args)}}}}}]}}}}]}}\n\n'
-        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
-        '"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],'
-        '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
-        'data: [DONE]\n\n'
-    ).encode()
-
-SSE_DONE = (
-    'data: {"id":"2","object":"chat.completion.chunk","created":0,"model":"mock",'
-    '"choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":null}]}\n\n'
-    'data: {"id":"2","object":"chat.completion.chunk","created":0,"model":"mock",'
-    '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
-    '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
-    'data: [DONE]\n\n'
-).encode()
-
-class RejectionHandler(BaseHTTPRequestHandler):
-    def log_message(self, *_): pass
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"object":"list","data":[]}')
-    def do_POST(self):
-        length = int(self.headers.get("content-length", "0"))
-        raw = self.rfile.read(length)
-        try:
-            body = json.loads(raw)
-        except Exception:
-            body = {"_raw": raw.decode("utf-8", "replace")}
-        with rej_lock:
-            rej_captured.append({"path": self.path, "body": body})
-            is_tools_req = ("chat/completions" in self.path and body.get("tools")
-                            and not is_heartbeat_request(body))
-            if is_tools_req:
-                rej_step[0] += 1
-                step = rej_step[0]
-            else:
-                step = 0
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        # step 1: emit the bad tool call; all subsequent: emit "done"
-        self.wfile.write(sse_tool_call(BAD_ARGS) if step == 1 else SSE_DONE)
-
-rej_port = free_port()
-rej_server = ThreadingHTTPServer(("127.0.0.1", rej_port), RejectionHandler)
-threading.Thread(target=rej_server.serve_forever, daemon=True).start()
-rej_base = f"http://127.0.0.1:{rej_port}/v1"
+# fake-openai with consume-only-with-tools so opencode's title-generation call
+# (no tools) does not consume the queue. program the bad tool_call (priority not
+# in the enum) then a plain "done"; opencode rejects the args before execution.
+BAD_ARGS = {"name": "x.md", "content": "y", "priority": "urgent"}
+rej_fake, rej_base, rej_admin = start_fake_openai("--consume-only-with-tools")
+program_responses(rej_admin, [
+    {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                     "function": {"name": "hello_note_write",
+                                  "arguments": json.dumps(BAD_ARGS)}}],
+     "finish_reason": "tool_calls"},
+    {"content": "done", "finish_reason": "stop"},
+])
 
 rej_project = Path(tempfile.mkdtemp(prefix="evolve-rej-test-"))
 shutil.copytree(hello_src, rej_project / "project", dirs_exist_ok=False)
@@ -596,7 +562,7 @@ rej_dir = rej_project / "project"
 rej_config = dict(config)
 rej_config["provider"] = {"mock": {
     "name": "Mock", "options": {"apiKey": "test", "baseURL": rej_base},
-    "models": {"mock": {"name": "Mock Model"}},
+    "models": {"fake-model": {"name": "Fake Model"}},
 }}
 (rej_dir / "opencode.json").write_text(json.dumps(rej_config, indent=2))
 
@@ -613,13 +579,12 @@ rej_proc = subprocess.Popen(
 rej_deadline = time.time() + 60
 followup = None
 while time.time() < rej_deadline:
-    with rej_lock:
-        tools_reqs = [c for c in rej_captured
-                      if "chat/completions" in c["path"] and c["body"].get("tools")
-                      and not is_heartbeat_request(c["body"])]
-        if len(tools_reqs) >= 2:
-            followup = tools_reqs[1]
-            break
+    tools_reqs = [c for c in fetch_captures(rej_admin)
+                  if "chat/completions" in c["path"] and c["body"].get("tools")
+                  and not is_heartbeat_request(c["body"])]
+    if len(tools_reqs) >= 2:
+        followup = tools_reqs[1]
+        break
     if rej_proc.poll() is not None:
         break
     time.sleep(0.2)
@@ -631,7 +596,8 @@ try:
 except subprocess.TimeoutExpired:
     rej_proc.kill()
     rej_stdout, rej_stderr = rej_proc.communicate()
-rej_server.shutdown()
+rej_captured = fetch_captures(rej_admin)
+rej_fake.terminate()
 
 (ARTIFACTS / "opencode_rejection.stdout.log").write_text(rej_stdout or "")
 (ARTIFACTS / "opencode_rejection.stderr.log").write_text(rej_stderr or "")
@@ -674,32 +640,9 @@ shutil.rmtree(rej_project, ignore_errors=True)
 # hook-less default. assert the abstained prompt does NOT leak into the
 # main chat request.
 
-abs_captured, abs_lock = [], threading.Lock()
-class AbstainHandler(BaseHTTPRequestHandler):
-    def log_message(self, *_): pass
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"object":"list","data":[]}')
-    def do_POST(self):
-        length = int(self.headers.get("content-length", "0"))
-        raw = self.rfile.read(length)
-        try:
-            body = json.loads(raw)
-        except Exception:
-            body = {"_raw": raw.decode("utf-8", "replace")}
-        with abs_lock:
-            abs_captured.append({"path": self.path, "body": body})
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(SSE_RESPONSE)
-
-abs_port = free_port()
-abs_server = ThreadingHTTPServer(("127.0.0.1", abs_port), AbstainHandler)
-threading.Thread(target=abs_server.serve_forever, daemon=True).start()
+# fake-openai with the default fallback stream — this scenario just needs a
+# plain capture-and-ok server.
+abs_fake, abs_base, abs_admin = start_fake_openai()
 
 # distinctive marker strings — if these appear in any outgoing system prompt,
 # evolve injected its default-composition from prompts/*.md despite the hook
@@ -729,11 +672,11 @@ abs_hook.chmod(0o755)
 abs_config = {
     "$schema": "https://opencode.ai/config.json",
     "provider": {"mock": {
-        "name": "Mock", "options": {"apiKey": "test", "baseURL": f"http://127.0.0.1:{abs_port}/v1"},
-        "models": {"mock": {"name": "Mock Model"}},
+        "name": "Mock", "options": {"apiKey": "test", "baseURL": abs_base},
+        "models": {"fake-model": {"name": "Fake Model"}},
     }},
-    "model": "mock/mock",
-    "small_model": "mock/mock",
+    "model": "mock/fake-model",
+    "small_model": "mock/fake-model",
     "plugin": [plugin_path.as_uri()],
 }
 (abs_dir / "opencode.json").write_text(json.dumps(abs_config, indent=2))
@@ -749,9 +692,9 @@ abs_proc = subprocess.Popen(
 
 abs_deadline = time.time() + 60
 while time.time() < abs_deadline:
-    with abs_lock:
-        if any("chat/completions" in c["path"] and c["body"].get("tools") for c in abs_captured):
-            break
+    if any("chat/completions" in c["path"] and c["body"].get("tools")
+           for c in fetch_captures(abs_admin)):
+        break
     if abs_proc.poll() is not None:
         break
     time.sleep(0.2)
@@ -763,7 +706,8 @@ try:
 except subprocess.TimeoutExpired:
     abs_proc.kill()
     abs_stdout, abs_stderr = abs_proc.communicate()
-abs_server.shutdown()
+abs_captured = fetch_captures(abs_admin)
+abs_fake.terminate()
 
 (ARTIFACTS / "opencode_abstain.stdout.log").write_text(abs_stdout or "")
 (ARTIFACTS / "opencode_abstain.stderr.log").write_text(abs_stderr or "")
@@ -801,57 +745,18 @@ shutil.rmtree(abs_project, ignore_errors=True)
 # hook-defined tool actually prevents execution and surfaces as an error in
 # the follow-up tool-result.
 
-perm_captured, perm_lock = [], threading.Lock()
-perm_step = [0]
-
-# first non-heartbeat tools-bearing request: emit a tool_call for note_write
-# targeting the denied pattern. any subsequent request: emit "done".
-DENIED_ARGS = '{"name":"blocked.md","content":"should not be written"}'
-def sse_note_write_call(args):
-    return (
-        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
-        '"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,'
-        '"id":"call_1","type":"function","function":{"name":"hello_note_write",'
-        f'"arguments":{json.dumps(args)}}}}}]}}}}]}}\n\n'
-        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"mock",'
-        '"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],'
-        '"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
-        'data: [DONE]\n\n'
-    ).encode()
-
-class PermHandler(BaseHTTPRequestHandler):
-    def log_message(self, *_): pass
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"object":"list","data":[]}')
-    def do_POST(self):
-        length = int(self.headers.get("content-length", "0"))
-        raw = self.rfile.read(length)
-        try:
-            body = json.loads(raw)
-        except Exception:
-            body = {"_raw": raw.decode("utf-8", "replace")}
-        with perm_lock:
-            perm_captured.append({"path": self.path, "body": body})
-            is_tools_req = ("chat/completions" in self.path and body.get("tools")
-                            and not is_heartbeat_request(body))
-            if is_tools_req:
-                perm_step[0] += 1
-                step = perm_step[0]
-            else:
-                step = 0
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(sse_note_write_call(DENIED_ARGS) if step == 1 else SSE_DONE)
-
-perm_port = free_port()
-perm_server = ThreadingHTTPServer(("127.0.0.1", perm_port), PermHandler)
-threading.Thread(target=perm_server.serve_forever, daemon=True).start()
-perm_base = f"http://127.0.0.1:{perm_port}/v1"
+# fake-openai with consume-only-with-tools; program a note_write tool_call
+# targeting the denied path, then a plain "done". opencode's deny rule must
+# block execution before the file is written.
+DENIED_ARGS = {"name": "blocked.md", "content": "should not be written"}
+perm_fake, perm_base, perm_admin = start_fake_openai("--consume-only-with-tools")
+program_responses(perm_admin, [
+    {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                     "function": {"name": "hello_note_write",
+                                  "arguments": json.dumps(DENIED_ARGS)}}],
+     "finish_reason": "tool_calls"},
+    {"content": "done", "finish_reason": "stop"},
+])
 
 perm_project = Path(tempfile.mkdtemp(prefix="evolve-perm-test-"))
 shutil.copytree(hello_src, perm_project / "project", dirs_exist_ok=False)
@@ -863,10 +768,10 @@ perm_config = {
     "$schema": "https://opencode.ai/config.json",
     "provider": {"mock": {
         "name": "Mock", "options": {"apiKey": "test", "baseURL": perm_base},
-        "models": {"mock": {"name": "Mock Model"}},
+        "models": {"fake-model": {"name": "Fake Model"}},
     }},
-    "model": "mock/mock",
-    "small_model": "mock/mock",
+    "model": "mock/fake-model",
+    "small_model": "mock/fake-model",
     "plugin": [plugin_path.as_uri()],
     "permission": {
         "hello_note_write": {
@@ -890,13 +795,12 @@ perm_proc = subprocess.Popen(
 perm_deadline = time.time() + 60
 perm_followup = None
 while time.time() < perm_deadline:
-    with perm_lock:
-        tools_reqs = [c for c in perm_captured
-                      if "chat/completions" in c["path"] and c["body"].get("tools")
-                      and not is_heartbeat_request(c["body"])]
-        if len(tools_reqs) >= 2:
-            perm_followup = tools_reqs[1]
-            break
+    tools_reqs = [c for c in fetch_captures(perm_admin)
+                  if "chat/completions" in c["path"] and c["body"].get("tools")
+                  and not is_heartbeat_request(c["body"])]
+    if len(tools_reqs) >= 2:
+        perm_followup = tools_reqs[1]
+        break
     if perm_proc.poll() is not None:
         break
     time.sleep(0.2)
@@ -908,7 +812,8 @@ try:
 except subprocess.TimeoutExpired:
     perm_proc.kill()
     perm_stdout, perm_stderr = perm_proc.communicate()
-perm_server.shutdown()
+perm_captured = fetch_captures(perm_admin)
+perm_fake.terminate()
 
 (ARTIFACTS / "opencode_permission.stdout.log").write_text(perm_stdout or "")
 (ARTIFACTS / "opencode_permission.stderr.log").write_text(perm_stderr or "")
@@ -965,33 +870,9 @@ shutil.rmtree(perm_project, ignore_errors=True)
 
 COMPACT_SENTINEL = "EVOLVE_COMPACTION_SENTINEL_ABCDEFG"
 
-cmp_captured, cmp_lock = [], threading.Lock()
-class CompactHandler(BaseHTTPRequestHandler):
-    def log_message(self, *_): pass
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"object":"list","data":[]}')
-    def do_POST(self):
-        length = int(self.headers.get("content-length", "0"))
-        raw = self.rfile.read(length)
-        try:
-            body = json.loads(raw)
-        except Exception:
-            body = {"_raw": raw.decode("utf-8", "replace")}
-        with cmp_lock:
-            cmp_captured.append({"path": self.path, "body": body})
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(SSE_RESPONSE)
-
-cmp_port = free_port()
-cmp_server = ThreadingHTTPServer(("127.0.0.1", cmp_port), CompactHandler)
-threading.Thread(target=cmp_server.serve_forever, daemon=True).start()
-cmp_base = f"http://127.0.0.1:{cmp_port}/v1"
+# fake-openai with the default fallback stream; opencode serve drives chat +
+# summarize against it, and we assert on the captured request prefixes.
+cmp_fake, cmp_base, cmp_admin = start_fake_openai()
 
 cmp_project = Path(tempfile.mkdtemp(prefix="evolve-compact-test-"))
 shutil.copytree(hello_src, cmp_project / "project", dirs_exist_ok=False)
@@ -1005,10 +886,10 @@ cmp_config = {
     "$schema": "https://opencode.ai/config.json",
     "provider": {"mock": {
         "name": "Mock", "options": {"apiKey": "test", "baseURL": cmp_base},
-        "models": {"mock": {"name": "Mock Model"}},
+        "models": {"fake-model": {"name": "Fake Model"}},
     }},
-    "model": "mock/mock",
-    "small_model": "mock/mock",
+    "model": "mock/fake-model",
+    "small_model": "mock/fake-model",
     "plugin": [plugin_path.as_uri()],
 }
 (cmp_dir / "opencode.json").write_text(json.dumps(cmp_config, indent=2))
@@ -1090,7 +971,7 @@ if session_id:
 if chat_ok:
     try:
         _http_json("POST", f"/session/{session_id}/summarize",
-                   {"providerID": "mock", "modelID": "mock"})
+                   {"providerID": "mock", "modelID": "fake-model"})
         summarize_ok = True
     except Exception as e:
         cmp_err = f"session summarize: {e}"
@@ -1104,13 +985,13 @@ try:
 except subprocess.TimeoutExpired:
     cmp_proc.kill()
     cmp_stdout, cmp_stderr = cmp_proc.communicate()
+cmp_captured = fetch_captures(cmp_admin)
+cmp_fake.terminate()
 
 (ARTIFACTS / "opencode_compaction.stdout.log").write_text(cmp_stdout or "")
 (ARTIFACTS / "opencode_compaction.stderr.log").write_text(cmp_stderr or "")
 (ARTIFACTS / "opencode_compaction.captured.json").write_text(
     json.dumps(cmp_captured, indent=2, default=str))
-
-cmp_server.shutdown()
 
 # find the chat and compaction LLM calls in the captured requests.
 # compaction discriminator: the sentinel appears in one of the messages.
@@ -1128,15 +1009,14 @@ def _has_sentinel(body):
     return False
 
 chat_cap = compact_cap = None
-with cmp_lock:
-    for c in cmp_captured:
-        if "chat/completions" not in c["path"]:
-            continue
-        body = c["body"]
-        if _has_sentinel(body):
-            compact_cap = compact_cap or c
-        elif body.get("tools"):
-            chat_cap = c  # latest tools-bearing non-compaction wins
+for c in cmp_captured:
+    if "chat/completions" not in c["path"]:
+        continue
+    body = c["body"]
+    if _has_sentinel(body):
+        compact_cap = compact_cap or c
+    elif body.get("tools"):
+        chat_cap = c  # latest tools-bearing non-compaction wins
 
 check("compaction: chat request captured", chat_cap is not None,
       f"captured paths: {[x['path'] for x in cmp_captured]}")

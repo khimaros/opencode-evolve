@@ -1,1 +1,0 @@
-../../hcp-spec/testing/mock_openai.py
