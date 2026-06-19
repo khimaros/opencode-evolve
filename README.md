@@ -352,7 +352,8 @@ hooks can return an `actions` array to trigger side effects:
 
 ## writing a custom hook
 
-see [`examples/hello/`](examples/hello/) for a complete working example. the hook script must:
+see the canonical `hello` hook in the [hcp-spec](https://github.com/khimaros/hcp-spec)
+repo (`conformance/fixtures/hello/`) for a complete working example. the hook script must:
 
 1. be executable
 2. accept the hook name as first argument (`sys.argv[1]`)

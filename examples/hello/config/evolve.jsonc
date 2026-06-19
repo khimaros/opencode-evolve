@@ -1,6 +1,0 @@
-{
-  "heartbeat_ms": 1800000,
-  "hook_timeout": 30000,
-  "heartbeat_title": "heartbeat",
-  "heartbeat_agent": "evolve"
-}

@@ -13,7 +13,6 @@ compile:
 
 test: compile
 	python3 tests/evolve_test.py
-	$(MAKE) -C examples/hello test
 .PHONY: test
 
 test-integration:

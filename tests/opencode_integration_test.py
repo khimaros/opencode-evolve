@@ -1,56 +1,50 @@
 #!/usr/bin/env python3
-"""end-to-end test: capture the actual LLM request opencode sends when the
-evolve plugin is loaded, via a mock openai-compatible server.
+"""end-to-end conformance test for opencode-evolve.
 
-strategy:
-  1. build the plugin (dist/index.js)
-  2. spawn the fake-openai binary as a subprocess impersonating an openai
-     chat-completions endpoint
-  3. write an opencode.json in a temp workspace that:
-       - defines a custom provider (npm defaults to @ai-sdk/openai-compatible)
-         whose baseURL points at our mock server
-       - registers dist/index.js as a plugin
-       - selects mock/fake-model as both model and small_model
-  4. run `opencode run "hello"` against that workspace
-  5. assert the captured request body contains a real system prompt and the
-     evolve_* tool schemas
-  6. dump the full captured payload to tests/.artifacts/ for inspection
+drives the shared hcp conformance suite (../hcp-spec/conformance) against the
+real opencode binary with the evolve plugin loaded, then adds the scenarios
+unique to opencode. the protocol-level build and heartbeat assertions live in
+the shared driver; this file owns the opencode seam (opencode.json provider +
+plugin registration, the binary launch, xdg/home isolation) and opencode's own
+scenarios:
+
+  1. build + heartbeat (shared driver): hello tools, system-prompt fidelity, the
+     heartbeat tick fired while the build was stalled
+  2. enum rejection: a tool_call with an out-of-enum value is rejected end-to-end
+  3. abstain: a hook returning {} must not clobber opencode's own system prompt
+  4. permission: a deny rule blocks a hook-defined tool before its side effects
+  5. compaction: the compaction request is a byte-identical prefix of the chat
+     request (KV-cache stability)
+
+OPENCODE_BIN / OPENCODE_SRC select the binary; see resolve_opencode_cmd.
 """
 
-import json, os, shlex, shutil, socket, subprocess, sys, tempfile, time
-import urllib.request, urllib.error
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = PROJECT_ROOT / "tests" / ".artifacts"
-ARTIFACTS.mkdir(parents=True, exist_ok=True)
+PLUGIN_PATH = PROJECT_ROOT / "dist" / "index.js"
 
-# the mock is the shared, language-agnostic fake-openai binary, driven through
-# its python client on the sibling ../fake-openai checkout. the client owns the
-# spawn + admin glue; the local names below keep the scenario call sites terse.
-sys.path.insert(0, str(PROJECT_ROOT.parent / "fake-openai" / "clients" / "python"))
-import fakeopenai
+sys.path.insert(0, str(PROJECT_ROOT.parent / "hcp-spec" / "conformance"))
+import hcpconform as hc
 
-if not fakeopenai.available():
-    print(f"SKIP: fake-openai binary not found at {fakeopenai.BIN}; "
-          "build ../fake-openai or set FAKE_OPENAI_BIN")
-    sys.exit(0)
-
-is_heartbeat_request = fakeopenai.is_heartbeat_request
-fetch_captures = fakeopenai.captures
-program_responses = fakeopenai.program
+HEARTBEAT_MS = 500
+STALL_SECONDS = 5
 
 
-def start_fake_openai(*args):
-    """launch fake-openai on a free port; return (proc, base_url, admin_url)."""
-    f = fakeopenai.FakeOpenAI(*args).start()
-    return f.proc, f.base_url, f.admin_url
-
-# opencode binary selection. defaults to `opencode` on PATH (the globally
-# installed npm release); overrides:
-#   OPENCODE_BIN=<command>   full command override (space-separated, shlex-parsed)
-#   OPENCODE_SRC=<path>      local opencode checkout; runs via `bun run <src>/packages/opencode/src/index.ts`
 def resolve_opencode_cmd():
+    """OPENCODE_BIN=<command> (shlex-split) or OPENCODE_SRC=<checkout> (run via
+    bun), else `opencode` on PATH."""
     override = os.environ.get("OPENCODE_BIN")
     if override:
         return shlex.split(override)
@@ -68,1033 +62,434 @@ def resolve_opencode_cmd():
         sys.exit(2)
     return [found]
 
+
 OPENCODE_CMD = resolve_opencode_cmd()
 print(f"opencode command: {' '.join(OPENCODE_CMD)}")
 
-PASS = FAIL = 0
 
-def check(desc, ok, detail=""):
-    global PASS, FAIL
-    if ok:
-        PASS += 1
-        print(f"PASS: {desc}")
-    else:
-        FAIL += 1
-        print(f"FAIL: {desc}")
-        if detail:
-            print(f"  {detail}")
-
-# --- mock openai-compatible server ---
-# each scenario launches its own fake-openai subprocess; the stall scenario
-# uses --stall-first-with-tools and the tool_call scenarios program a response
-# queue with --consume-only-with-tools.
-HEARTBEAT_MS = 500
-STALL_SECONDS = 5
+# --- opencode-specific setup helpers (shared across this file's scenarios) ---
 
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
-# --- build plugin ---
 
-print("building plugin...")
-r = subprocess.run(["npx", "tsc"], cwd=PROJECT_ROOT, capture_output=True, text=True)
-if r.returncode != 0:
-    print("FAIL: build")
-    print(r.stdout); print(r.stderr)
-    sys.exit(1)
-plugin_path = PROJECT_ROOT / "dist" / "index.js"
-check("plugin built", plugin_path.exists(), f"missing: {plugin_path}")
+def make_home():
+    """a throwaway HOME/xdg tree so the user's ~/.config/opencode never leaks
+    its providers/plugins/mcp servers into the test."""
+    home = Path(tempfile.mkdtemp(prefix="evolve-home-"))
+    for sub in (".config/opencode", ".local/share/opencode",
+                ".cache/opencode", ".local/state/opencode"):
+        (home / sub).mkdir(parents=True, exist_ok=True)
+    return home
 
-# --- set up workspace ---
 
-workdir = Path(tempfile.mkdtemp(prefix="evolve-llm-test-"))
-# seed the project from the hello example so its hook is autodiscovered and
-# exposes @tool-annotated functions. WORKSPACE == project_dir so the plugin's
-# heartbeat client can reuse projectClient (workspace-scoped client rebuild
-# doesn't work under `opencode run`, only `opencode serve --port=`).
-hello_src = PROJECT_ROOT / "examples" / "hello"
-shutil.copytree(hello_src, workdir / "project")
-project_dir = workdir / "project"
-evolve_workspace = project_dir
-# ensure hook is executable after copy
-hook_file = evolve_workspace / "hooks" / "hello.py"
-hook_file.chmod(0o755)
-
-fake, base_url, admin_url = start_fake_openai(
-    "--stall-first-with-tools", "--stall-seconds", str(STALL_SECONDS))
-print(f"mock server on {base_url}")
-
-config = {
-    "$schema": "https://opencode.ai/config.json",
-    "provider": {
-        "mock": {
-            "name": "Mock",
-            "options": {"apiKey": "test", "baseURL": base_url},
-            "models": {"fake-model": {"name": "Fake Model"}},
-        }
-    },
-    "model": "mock/fake-model",
-    "small_model": "mock/fake-model",
-    "plugin": [plugin_path.as_uri()],
-}
-(project_dir / "opencode.json").write_text(json.dumps(config, indent=2))
-
-# fully isolate opencode's global config / data / state from the user's
-# environment. opencode merges ~/.config/opencode/opencode.{json,jsonc} into
-# every project's config, which otherwise leaks MCP servers, providers,
-# plugins, etc. into these tests. point every xdg dir + HOME at a throwaway
-# tree so we're running against a pristine opencode install.
-fake_home = Path(tempfile.mkdtemp(prefix="evolve-home-"))
-for sub in (".config/opencode", ".local/share/opencode",
-            ".cache/opencode", ".local/state/opencode"):
-    (fake_home / sub).mkdir(parents=True, exist_ok=True)
-
-# start from os.environ for PATH / locale / node binaries, then strip any
-# opencode-specific vars that could re-inject outside config. drop PWD too:
-# `opencode run` resolves its root as `process.env.PWD ?? process.cwd()`
-# (cli/cmd/run.ts), so inheriting the calling shell's PWD overrides each
-# Popen's cwd and binds opencode to the wrong directory across scenarios.
-base_env = {k: v for k, v in os.environ.items()
+def make_env(workspace, home, **extra):
+    # strip opencode/xdg vars and PWD (opencode run resolves root from PWD).
+    base = {k: v for k, v in os.environ.items()
             if not k.startswith(("OPENCODE_", "XDG_")) and k != "PWD"}
+    env = {
+        **base, "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"), "XDG_DATA_HOME": str(home / ".local/share"),
+        "XDG_CACHE_HOME": str(home / ".cache"), "XDG_STATE_HOME": str(home / ".local/state"),
+        "OPENCODE_TEST_HOME": str(home), "OPENCODE_EVOLVE_WORKSPACE": str(workspace),
+        "EVOLVE_HEARTBEAT_MS": str(HEARTBEAT_MS), "EVOLVE_MODEL": "mock/fake-model",
+        "EVOLVE_HEARTBEAT_SKIP_ACTIVE": "false", "EVOLVE_HEARTBEAT_AGENT": "build",
+        "OPENAI_API_KEY": "test", "CI": "1",
+    }
+    env.update(extra)
+    return env
 
-env = {
-    **base_env,
-    "HOME": str(fake_home),
-    "XDG_CONFIG_HOME": str(fake_home / ".config"),
-    "XDG_DATA_HOME": str(fake_home / ".local/share"),
-    "XDG_CACHE_HOME": str(fake_home / ".cache"),
-    "XDG_STATE_HOME": str(fake_home / ".local/state"),
-    "OPENCODE_TEST_HOME": str(fake_home),
-    "OPENCODE_EVOLVE_WORKSPACE": str(evolve_workspace),
-    "EVOLVE_HEARTBEAT_MS": str(HEARTBEAT_MS),
-    # heartbeat tick fires before chat.message captures the model, so seed it
-    "EVOLVE_MODEL": "mock/fake-model",
-    # the build session is intentionally stalled — don't let heartbeat skip on it
-    "EVOLVE_HEARTBEAT_SKIP_ACTIVE": "false",
-    # no custom agents in the test opencode.json — use the builtin
-    "EVOLVE_HEARTBEAT_AGENT": "build",
-    "OPENAI_API_KEY": "test",
-    # avoid opencode trying to autoupdate / share
-    "CI": "1",
-}
 
-# --- run opencode ---
+def make_config(base_url, **extra):
+    cfg = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {"mock": {"name": "Mock", "options": {"apiKey": "test", "baseURL": base_url},
+                              "models": {"fake-model": {"name": "Fake Model"}}}},
+        "model": "mock/fake-model", "small_model": "mock/fake-model",
+        "plugin": [PLUGIN_PATH.as_uri()],
+    }
+    cfg.update(extra)
+    return cfg
 
-print("running opencode...")
-proc = subprocess.Popen(
-    [*OPENCODE_CMD, "run", "--agent", "hello", "--print-logs", "--log-level", "INFO", "hello world"],
-    cwd=str(project_dir),
-    env=env,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-)
 
-# wait up to 90s for two tools-bearing chat-completions requests:
-#   1) the real build-agent request (stalled by the mock for STALL_SECONDS)
-#   2) the heartbeat tick that fires inside the plugin while the build is stalled
-# (opencode also fires title-generation with no tools — ignored)
-deadline = time.time() + 90
-chat_req = None
-hb_req_seen = None
-while time.time() < deadline:
-    for c in fetch_captures(admin_url):
-        if "chat/completions" not in c["path"]:
-            continue
-        if not c["body"].get("tools"):
-            continue
-        if is_heartbeat_request(c["body"]):
-            hb_req_seen = hb_req_seen or c
-        else:
-            chat_req = chat_req or c
-    if chat_req and hb_req_seen:
-        break
-    if proc.poll() is not None:
-        time.sleep(0.5)
-        for c in fetch_captures(admin_url):
-            if "chat/completions" in c["path"] and c["body"].get("tools"):
-                if is_heartbeat_request(c["body"]):
-                    hb_req_seen = hb_req_seen or c
-                else:
-                    chat_req = chat_req or c
-        break
-    time.sleep(0.2)
+def seed_project(fixture, base_url, **config_extra):
+    """temp workspace seeded from the fixture with an opencode.json written.
+    returns (parent_tmp, project_dir) -- caller removes parent_tmp."""
+    parent = Path(tempfile.mkdtemp(prefix="evolve-oc-test-"))
+    project = hc.seed_workspace(parent / "project", fixture)
+    (project / "opencode.json").write_text(json.dumps(make_config(base_url, **config_extra), indent=2))
+    return parent, project
 
-if proc.poll() is None:
-    proc.terminate()
-try:
-    stdout, stderr = proc.communicate(timeout=30)
-except subprocess.TimeoutExpired:
-    proc.kill()
-    stdout, stderr = proc.communicate()
 
-(ARTIFACTS / "opencode_integration.stdout.log").write_text(stdout or "")
-(ARTIFACTS / "opencode_integration.stderr.log").write_text(stderr or "")
+def run_opencode(project, env, prompt, *args, deadline_s=60):
+    """run `opencode run [...] <prompt>` to completion, terminating once the
+    deadline passes. returns (proc, stdout, stderr)."""
+    proc = subprocess.Popen(
+        [*OPENCODE_CMD, "run", *args, "--print-logs", "--log-level", "INFO", prompt],
+        cwd=str(project), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return proc
 
-captured = fetch_captures(admin_url)
-fake.terminate()
 
-check("chat/completions request captured", chat_req is not None,
-      f"captured paths: {[c['path'] for c in captured]}")
+def drain(proc, timeout=15):
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        return proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.communicate()
 
-if not chat_req:
-    shutil.rmtree(workdir, ignore_errors=True)
-    print(f"\n{PASS} passed, {FAIL} failed")
-    sys.exit(1 if FAIL else 0)
 
-# --- dump artifact ---
+# --- jsonValue-union helpers (opencode commit fa5b1d7) ---
 
-(ARTIFACTS / "opencode_integration.build_request.json").write_text(json.dumps(chat_req, indent=2, default=str))
-print(f"captured request dumped to {ARTIFACTS / 'opencode_integration.build_request.json'}")
-
-body = chat_req["body"]
-
-# --- assertions on system prompt ---
-
-messages = body.get("messages", [])
-system_msgs = [m for m in messages if m.get("role") == "system"]
-check("has system message(s)", len(system_msgs) > 0, f"messages: {[m.get('role') for m in messages]}")
-
-system_text = "\n".join(
-    (m["content"] if isinstance(m.get("content"), str)
-     else "".join(p.get("text", "") for p in (m.get("content") or []) if isinstance(p, dict)))
-    for m in system_msgs
-)
-check("system prompt non-empty", len(system_text) > 100, f"len={len(system_text)}")
-
-# hello's mutate_request fully replaces opencode's system prompt with
-# preamble.md + chat.md + (optional notes line) + <env> block. assert each
-# piece verbatim from the hello example so drift in either the prompt files
-# or the composition logic in hooks/hello.py is caught here.
-hello_prompts = PROJECT_ROOT / "examples" / "hello" / "prompts"
-expected_preamble = (hello_prompts / "preamble.md").read_text().strip()
-expected_chat = (hello_prompts / "chat.md").read_text().strip()
-check("system prompt contains hello preamble verbatim",
-      expected_preamble in system_text,
-      f"expected:\n{expected_preamble}\n\ngot:\n{system_text[:500]}")
-check("system prompt contains hello chat stage verbatim",
-      expected_chat in system_text,
-      f"expected:\n{expected_chat}\n\ngot:\n{system_text[:500]}")
-check("system prompt contains <env> block with session start",
-      "<env>" in system_text and "Session start time:" in system_text and "</env>" in system_text,
-      f"got: {system_text[:500]}")
-# only preamble + chat should appear in the build-agent prompt; heartbeat
-# stage body must not leak here.
-expected_heartbeat = (hello_prompts / "heartbeat.md").read_text().strip()
-check("system prompt does not include heartbeat stage body",
-      expected_heartbeat not in system_text,
-      "heartbeat prompt leaked into build-agent system prompt")
-
-# --- assertions on tools ---
-
-tools = body.get("tools", [])
-check("tools array present", isinstance(tools, list) and len(tools) > 0, f"got: {type(tools).__name__} len={len(tools) if isinstance(tools, list) else 'n/a'}")
-
-tool_names = []
-for t in tools if isinstance(tools, list) else []:
-    # openai format: {"type":"function","function":{"name":...,"parameters":...}}
-    fn = t.get("function") if isinstance(t, dict) else None
-    if fn and "name" in fn:
-        tool_names.append(fn["name"])
-
-check("tool names parsed", len(tool_names) > 0, f"tools[0]={tools[0] if tools else None}")
-
-expected_evolve_tools = {
-    "evolve_datetime",
-    "evolve_prompt_list",
-    "evolve_hook_list",
-}
-present = expected_evolve_tools & set(tool_names)
-check(f"builtin evolve tools present ({sorted(expected_evolve_tools)})",
-      present == expected_evolve_tools,
-      f"found: {sorted(present)}; all tools: {sorted(tool_names)}")
-
-# every tool should have a parameters schema
-missing_schema = [n for n in tool_names if not any(
-    (t.get("function", {}).get("name") == n and t.get("function", {}).get("parameters"))
-    for t in tools
-)]
-check("all tools have parameters schema", not missing_schema, f"missing: {missing_schema}")
-
-# --- prompt contract: evolve_prompt_{read,write,edit} must enum-constrain prompt arg ---
-EXPECTED_PROMPT_FILES = ["preamble.md", "chat.md", "heartbeat.md", "compaction.md", "recover.md"]
-
-def tool_params_local(name):
-    for t in tools:
-        fn = t.get("function", {})
-        if fn.get("name") == name:
-            return fn.get("parameters", {})
-    return {}
-
-for prompt_tool in ("evolve_prompt_read", "evolve_prompt_write", "evolve_prompt_edit"):
-    params = tool_params_local(prompt_tool)
-    prompt_prop = (params.get("properties") or {}).get("prompt") or {}
-    check(f"{prompt_tool}.prompt has enum",
-          set(prompt_prop.get("enum") or []) == set(EXPECTED_PROMPT_FILES),
-          f"got: {prompt_prop.get('enum')}")
-    check(f"{prompt_tool}.prompt description mentions contract",
-          "contract" in (prompt_prop.get("description") or "").lower(),
-          f"got: {prompt_prop.get('description')}")
-
-# --- assertions on hook-defined tools from examples/hello ---
-# hook prefix is "evolve" (from discover), so note_* → hello_note_*
-
-expected_hello_tools = {
-    "hello_note_list",
-    "hello_note_read",
-    "hello_note_write",
-    "hello_note_delete",
-}
-present_hello = expected_hello_tools & set(tool_names)
-check(f"hello hook tools present ({sorted(expected_hello_tools)})",
-      present_hello == expected_hello_tools,
-      f"found: {sorted(present_hello)}")
-
-def tool_params(name):
-    for t in tools:
-        fn = t.get("function", {})
-        if fn.get("name") == name:
-            return fn.get("parameters", {})
-    return {}
-
-def prop(name, field):
-    return (tool_params(name).get("properties") or {}).get(field) or {}
-
-def required(name):
-    return set(tool_params(name).get("required") or [])
-
-# hello_note_list: include_hidden: boolean, optional
-p = prop("hello_note_list", "include_hidden")
-check("note_list.include_hidden is boolean", p.get("type") == "boolean", f"got: {p}")
-check("note_list.include_hidden has description", "hidden" in (p.get("description") or "").lower())
-check("note_list.include_hidden is optional (not in required)",
-      "include_hidden" not in required("hello_note_list"),
-      f"required: {required('hello_note_list')}")
-
-# hello_note_read: name: string required, limit: number optional
-p = prop("hello_note_read", "name")
-check("note_read.name is string", p.get("type") == "string", f"got: {p}")
-check("note_read.name is required", "name" in required("hello_note_read"))
-p = prop("hello_note_read", "limit")
-check("note_read.limit is number", p.get("type") == "number", f"got: {p}")
-check("note_read.limit is optional", "limit" not in required("hello_note_read"))
-
-# hello_note_write: name+content required strings, tags: array[string] optional, metadata: object optional
-p = prop("hello_note_write", "tags")
-check("note_write.tags is array", p.get("type") == "array", f"got: {p}")
-items_type = (p.get("items") or {}).get("type")
-check("note_write.tags items are string", items_type == "string", f"got items: {p.get('items')}")
-check("note_write.tags is optional", "tags" not in required("hello_note_write"))
-
-p = prop("hello_note_write", "metadata")
-check("note_write.metadata is object", p.get("type") == "object", f"got: {p}")
-check("note_write.metadata is optional", "metadata" not in required("hello_note_write"))
-
-# enum param: note_write.priority is a string constrained to a fixed set
-p = prop("hello_note_write", "priority")
-check("note_write.priority has enum", p.get("enum") == ["low", "normal", "high"], f"got: {p}")
-check("note_write.priority is optional", "priority" not in required("hello_note_write"))
-
-# verify the captured schema actually rejects non-enum values per JSON Schema
-import jsonschema
-write_schema_full = tool_params("hello_note_write")
-valid_payload = {"name": "x.md", "content": "y", "priority": "high"}
-invalid_payload = {"name": "x.md", "content": "y", "priority": "urgent"}
-ok_valid = True
-try:
-    jsonschema.validate(valid_payload, write_schema_full)
-except jsonschema.ValidationError as e:
-    ok_valid = False
-    valid_err = str(e)
-check("note_write valid enum value passes jsonschema validation",
-      ok_valid, f"unexpectedly rejected: {valid_err if not ok_valid else ''}")
-ok_invalid = False
-invalid_err = ""
-try:
-    jsonschema.validate(invalid_payload, write_schema_full)
-except jsonschema.ValidationError as e:
-    ok_invalid = True
-    invalid_err = str(e)
-check("note_write invalid enum value is rejected by jsonschema",
-      ok_invalid and "priority" in invalid_err,
-      f"got: {invalid_err or '(no error)'}")
-
-# verify commit fa5b1d7 ("more precise zod schema for nested objects"):
-# object/array/any params must expose the explicit jsonValue primitive union
-# (string|number|boolean|null|array|object) rather than an under-specified `any`.
-def resolve_schema(node, full_schema):
-    """follow a single $ref if present, returning the resolved object.
-    opencode emits the table under `definitions` even though the refs use
-    `#/$defs/…`, so check both keys."""
+def resolve_schema(node, full):
+    """follow a single $ref; opencode emits the table under `definitions`
+    even though refs use `#/$defs/...`, so check both."""
     if isinstance(node, dict) and "$ref" in node:
         ref = node["$ref"]
         if ref.startswith("#/$defs/") or ref.startswith("#/definitions/"):
-            key = ref.split("/")[-1]
-            defs = full_schema.get("$defs") or full_schema.get("definitions") or {}
-            return defs.get(key, {})
+            defs = full.get("$defs") or full.get("definitions") or {}
+            return defs.get(ref.split("/")[-1], {})
     return node
 
-def has_primitive_union(node, full_schema):
-    """true if node (possibly via $ref) is an anyOf containing >=4 primitives"""
-    node = resolve_schema(node, full_schema)
+
+def has_primitive_union(node, full):
+    """true if node (possibly via $ref) is an anyOf/oneOf covering the json
+    primitive union (string|number|boolean|null), proving it is not a bare any."""
+    node = resolve_schema(node, full)
     if not isinstance(node, dict):
         return False
-    variants = node.get("anyOf") or node.get("oneOf") or []
-    types = {v.get("type") for v in variants if isinstance(v, dict)}
-    # require at least string+number+boolean+null to prove it's the jsonValue union
+    types = {v.get("type") for v in (node.get("anyOf") or node.get("oneOf") or [])
+             if isinstance(v, dict)}
     return {"string", "number", "boolean", "null"}.issubset(types)
 
-write_schema = tool_params("hello_note_write")
 
-# object without inner types → additionalProperties must resolve to jsonValue union
-metadata_node = (write_schema.get("properties") or {}).get("metadata") or {}
-addl = metadata_node.get("additionalProperties")
-check("note_write.metadata values are jsonValue union (not bare any)",
-      addl is not None and has_primitive_union(addl, write_schema),
-      f"got additionalProperties: {addl}")
+class OpencodeAdapter(hc.HostAdapter):
+    name = "opencode-evolve"
+    wants_heartbeat = True
+    builtin_tools = {"evolve_datetime", "evolve_prompt_list", "evolve_hook_list"}
 
-# any type → schema must itself resolve to the jsonValue union
-p_extras = (write_schema.get("properties") or {}).get("extras") or {}
-check("note_write.extras (type=any) is jsonValue union",
-      has_primitive_union(p_extras, write_schema),
-      f"got: {p_extras}")
+    def __init__(self):
+        self.stderr = ""
 
-# bare array (no inner type) → items must resolve to jsonValue union
-p_raw = (write_schema.get("properties") or {}).get("raw_list") or {}
-check("note_write.raw_list is array", p_raw.get("type") == "array", f"got: {p_raw}")
-items_node = p_raw.get("items")
-check("note_write.raw_list items are jsonValue union (not bare any)",
-      items_node is not None and has_primitive_union(items_node, write_schema),
-      f"got items: {items_node}")
+    def build(self, runner):
+        r = subprocess.run(["npx", "tsc"], cwd=PROJECT_ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            runner.check("plugin built", False, (r.stdout or "") + (r.stderr or ""))
+            return False
+        runner.check("plugin built", PLUGIN_PATH.exists(), f"missing: {PLUGIN_PATH}")
+        return PLUGIN_PATH.exists()
 
-req_write = required("hello_note_write")
-check("note_write.name required", "name" in req_write)
-check("note_write.content required", "content" in req_write)
-for opt_field in ("tags", "metadata", "extras", "raw_list"):
-    check(f"note_write.{opt_field} is optional",
-          opt_field not in req_write, f"required: {req_write}")
+    def run_build(self, fixture):
+        fake = hc.start_fake_openai("--stall-first-with-tools",
+                                    "--stall-seconds", str(STALL_SECONDS))
+        print(f"mock server on {fake.base_url}")
+        parent, project = seed_project(fixture, fake.base_url)
+        home = make_home()
+        env = make_env(project, home)
+        print("running opencode...")
+        proc = run_opencode(project, env, "hello world", "--agent", "hello")
+        # wait up to 90s for both the stalled build request and the heartbeat
+        # tick that fires inside the plugin while the build is stalled.
+        def both():
+            caps = fake.captures()
+            b, hb = hc.find_build_request(caps), hc.find_heartbeat_request(caps)
+            return (b, hb) if (b and hb) else None
+        found = hc.poll_for(both, proc, 90) or (None, None)
+        stdout, self.stderr = drain(proc, timeout=30)
+        caps = fake.captures()
+        fake.stop()
+        shutil.rmtree(parent, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
+        build = found[0] or hc.find_build_request(caps)
+        heartbeat = found[1] or hc.find_heartbeat_request(caps)
+        return hc.RunResult(build, heartbeat, caps, stdout, self.stderr)
 
-# hello_note_delete: name required string
-p = prop("hello_note_delete", "name")
-check("note_delete.name is string", p.get("type") == "string", f"got: {p}")
-check("note_delete.name is required", "name" in required("hello_note_delete"))
+    def extra_build_checks(self, body, fixture, runner):
+        hc.assert_builtin_tools(body, self.builtin_tools, runner)
+        hc.assert_note_tags_array(body, runner)
+        runner.check("note_list.include_hidden has description",
+                     "hidden" in (hc.prop(body, "hello_note_list", "include_hidden")
+                                  .get("description") or "").lower())
+        # every tool exposes a parameters schema.
+        no_params = sorted(n for n in hc.tool_names(body) if not hc.tool_params(body, n))
+        runner.check("all tools have parameters schema", not no_params, f"missing: {no_params}")
+        hc.assert_param_descriptions(body, runner, prefixes=("evolve_", "hello_"))
+        hc.assert_system_preamble_chat(body, fixture, runner)
+        self._check_prompt_enums(body, runner)
+        self._check_jsonvalue_unions(body, runner)
 
-# --- assertions on heartbeat flow ---
-# while the build request was stalled, the plugin's heartbeat tick should have
-# fired (EVOLVE_HEARTBEAT_MS << STALL_SECONDS), creating a new session and
-# sending a chat/completions request whose user message starts with [heartbeat]
-# and whose system prompt comes from hello's heartbeat() hook.
+    def _check_prompt_enums(self, body, runner):
+        for t in ("evolve_prompt_read", "evolve_prompt_write", "evolve_prompt_edit"):
+            p = hc.prop(body, t, "prompt")
+            runner.check(f"{t}.prompt has enum",
+                         hc.enum_values(p) == set(hc.CONTRACT_PROMPTS), f"got: {p.get('enum')}")
+            runner.check(f"{t}.prompt description mentions contract",
+                         "contract" in (p.get("description") or "").lower(),
+                         f"got: {p.get('description')}")
 
-hb_req = None
-for c in captured:
-    if "chat/completions" in c["path"] and is_heartbeat_request(c["body"]):
-        hb_req = c
-        break
+    def _check_jsonvalue_unions(self, body, runner):
+        schema = hc.tool_params(body, "hello_note_write")
+        props = schema.get("properties") or {}
+        addl = (props.get("metadata") or {}).get("additionalProperties")
+        runner.check("note_write.metadata values are jsonValue union (not bare any)",
+                     addl is not None and has_primitive_union(addl, schema), f"got: {addl}")
+        runner.check("note_write.extras (type=any) is jsonValue union",
+                     has_primitive_union(props.get("extras") or {}, schema),
+                     f"got: {props.get('extras')}")
+        raw = props.get("raw_list") or {}
+        runner.check("note_write.raw_list is array", raw.get("type") == "array", f"got: {raw}")
+        runner.check("note_write.raw_list items are jsonValue union (not bare any)",
+                     raw.get("items") is not None and has_primitive_union(raw.get("items"), schema),
+                     f"got items: {raw.get('items')}")
+        for opt in ("extras", "raw_list"):
+            runner.check(f"note_write.{opt} is optional",
+                         opt not in hc.required(body, "hello_note_write"))
 
-check("heartbeat chat/completions request captured", hb_req is not None,
-      f"captured paths: {[c['path'] for c in captured]}")
 
-if hb_req:
-    (ARTIFACTS / "opencode_integration.heartbeat_request.json").write_text(
-        json.dumps(hb_req, indent=2, default=str))
-    hb_body = hb_req["body"]
-    hb_messages = hb_body.get("messages", [])
+# --- opencode-unique scenarios ---
 
-    def message_text(m):
-        c = m.get("content")
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            return "".join(p.get("text", "") for p in c if isinstance(p, dict))
-        return ""
-
-    user_msgs = [message_text(m) for m in hb_messages if m.get("role") == "user"]
-    check("heartbeat user message has [heartbeat] prefix",
-          any("[heartbeat]" in t for t in user_msgs),
-          f"user msgs: {[t[:80] for t in user_msgs]}")
-    check("heartbeat user message contains hello prompt body",
-          any("Review your notes" in t for t in user_msgs),
-          f"user msgs: {[t[:80] for t in user_msgs]}")
-
-    hb_system = "\n".join(
-        message_text(m) for m in hb_messages if m.get("role") == "system")
-    check("heartbeat system prompt non-empty", len(hb_system) > 0)
-    # heartbeat composes preamble + heartbeat.md + <env>; chat.md must NOT appear.
-    check("heartbeat system prompt contains hello preamble verbatim",
-          expected_preamble in hb_system,
-          f"got: {hb_system[:500]}")
-    check("heartbeat system prompt contains heartbeat stage verbatim",
-          expected_heartbeat in hb_system,
-          f"got: {hb_system[:500]}")
-    check("heartbeat system prompt does not include chat stage body",
-          expected_chat not in hb_system,
-          "chat prompt leaked into heartbeat system prompt")
-    check("heartbeat system prompt contains <env> block",
-          "<env>" in hb_system and "Session start time:" in hb_system,
-          f"got: {hb_system[:500]}")
-    check("heartbeat request carries tools",
-          isinstance(hb_body.get("tools"), list) and len(hb_body["tools"]) > 0)
-
-# --- end-to-end enum rejection ---
-# second opencode run against a mock that emits a tool_call for hello_note_write
-# with priority="urgent" (not in the enum). opencode should reject the args and
-# the next chat/completions request should carry a tool-result with an error.
-
-# fake-openai with consume-only-with-tools so opencode's title-generation call
-# (no tools) does not consume the queue. program the bad tool_call (priority not
-# in the enum) then a plain "done"; opencode rejects the args before execution.
-BAD_ARGS = {"name": "x.md", "content": "y", "priority": "urgent"}
-rej_fake, rej_base, rej_admin = start_fake_openai("--consume-only-with-tools")
-program_responses(rej_admin, [
-    {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
-                     "function": {"name": "hello_note_write",
-                                  "arguments": json.dumps(BAD_ARGS)}}],
-     "finish_reason": "tool_calls"},
-    {"content": "done", "finish_reason": "stop"},
-])
-
-rej_project = Path(tempfile.mkdtemp(prefix="evolve-rej-test-"))
-shutil.copytree(hello_src, rej_project / "project", dirs_exist_ok=False)
-rej_dir = rej_project / "project"
-(rej_dir / "hooks" / "hello.py").chmod(0o755)
-rej_config = dict(config)
-rej_config["provider"] = {"mock": {
-    "name": "Mock", "options": {"apiKey": "test", "baseURL": rej_base},
-    "models": {"fake-model": {"name": "Fake Model"}},
-}}
-(rej_dir / "opencode.json").write_text(json.dumps(rej_config, indent=2))
-
-rej_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(rej_dir),
-           "EVOLVE_HEARTBEAT_MS": "999999"}  # disable heartbeat noise
-
-rej_proc = subprocess.Popen(
-    [*OPENCODE_CMD, "run", "--agent", "hello", "--print-logs", "--log-level", "INFO", "write a note"],
-    cwd=str(rej_dir), env=rej_env,
-    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-)
-
-# wait for a second tools-bearing request (the one carrying the tool result)
-rej_deadline = time.time() + 60
-followup = None
-while time.time() < rej_deadline:
-    tools_reqs = [c for c in fetch_captures(rej_admin)
-                  if "chat/completions" in c["path"] and c["body"].get("tools")
-                  and not is_heartbeat_request(c["body"])]
-    if len(tools_reqs) >= 2:
-        followup = tools_reqs[1]
-        break
-    if rej_proc.poll() is not None:
-        break
-    time.sleep(0.2)
-
-if rej_proc.poll() is None:
-    rej_proc.terminate()
-try:
-    rej_stdout, rej_stderr = rej_proc.communicate(timeout=15)
-except subprocess.TimeoutExpired:
-    rej_proc.kill()
-    rej_stdout, rej_stderr = rej_proc.communicate()
-rej_captured = fetch_captures(rej_admin)
-rej_fake.terminate()
-
-(ARTIFACTS / "opencode_rejection.stdout.log").write_text(rej_stdout or "")
-(ARTIFACTS / "opencode_rejection.stderr.log").write_text(rej_stderr or "")
-(ARTIFACTS / "opencode_rejection.captured.json").write_text(
-    json.dumps(rej_captured, indent=2, default=str))
-
-check("rejection: follow-up chat/completions captured", followup is not None,
-      f"captured: {len(rej_captured)} reqs, tools-bearing: "
-      f"{sum(1 for c in rej_captured if c['body'].get('tools') and not is_heartbeat_request(c['body']))}")
-
-if followup:
-    # find the tool-result message that opencode sent back
-    msgs = followup["body"].get("messages", [])
+def _tool_result_text(req):
+    msgs = req["body"].get("messages", [])
     tool_msgs = [m for m in msgs if m.get("role") == "tool"]
-    tool_text = " ".join(
-        (m.get("content") if isinstance(m.get("content"), str)
-         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
-        for m in tool_msgs
-    )
-    check("rejection: tool-result message present",
-          len(tool_msgs) > 0, f"roles: {[m.get('role') for m in msgs]}")
-    # the error should reference either the bad value or the field — zod error
-    # text typically includes both. accept any substring that proves rejection.
-    err_markers = ("urgent", "priority", "enum", "invalid")
-    check("rejection: tool-result carries an error about the invalid enum",
-          any(mk in tool_text.lower() for mk in err_markers),
-          f"tool_text: {tool_text[:400]}")
+    text = " ".join(hc._content_text(m.get("content")) for m in tool_msgs)
+    return tool_msgs, text
 
-shutil.rmtree(rej_project, ignore_errors=True)
 
-# --- abstain: hook returning {} must not clobber opencode's system ---
-# regression test for the bug where evolve's mutate_request fallback imposed
-# a synthesized [preamble, chat] system (from prompts/*.md on disk) on every
-# request whose hook returned no system, AND cached that for the session.
-# opencode calls system.transform multiple times per session with different
-# payloads (main chat, title generation, ...). a hook that legitimately
-# abstains on non-main calls (e.g. persona's agent-marker check) would see
-# the first abstain cache-poison the session: every subsequent call — even
-# the main chat one — would skip the hook entirely and re-serve the wrong,
-# hook-less default. assert the abstained prompt does NOT leak into the
-# main chat request.
+def _wait_for_followup(fake, proc, deadline_s=60):
+    """wait for a second tools-bearing non-heartbeat request (the tool-result)."""
+    def followup():
+        reqs = [c for c in fake.chat_captures()
+                if c["body"].get("tools") and not hc.is_heartbeat_request(c["body"])]
+        return reqs[1] if len(reqs) >= 2 else None
+    return hc.poll_for(followup, proc, deadline_s)
 
-# fake-openai with the default fallback stream — this scenario just needs a
-# plain capture-and-ok server.
-abs_fake, abs_base, abs_admin = start_fake_openai()
 
-# distinctive marker strings — if these appear in any outgoing system prompt,
-# evolve injected its default-composition from prompts/*.md despite the hook
-# abstaining. they must not leak.
-ABSTAIN_PREAMBLE = "EVOLVE_DEFAULT_PREAMBLE_SENTINEL_ZZZ"
-ABSTAIN_CHAT = "EVOLVE_DEFAULT_CHAT_SENTINEL_QQQ"
+def scenario_rejection(runner, fixture):
+    """a tool_call with priority not in the enum is rejected before execution;
+    the follow-up tool-result carries an error about the invalid value."""
+    bad = {"name": "x.md", "content": "y", "priority": "urgent"}
+    fake = hc.start_fake_openai("--consume-only-with-tools")
+    hc.program(fake.admin_url, [
+        {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                         "function": {"name": "hello_note_write", "arguments": json.dumps(bad)}}],
+         "finish_reason": "tool_calls"},
+        {"content": "done", "finish_reason": "stop"}])
+    parent, project = seed_project(fixture, fake.base_url)
+    home = make_home()
+    env = make_env(project, home, EVOLVE_HEARTBEAT_MS="999999")
+    proc = run_opencode(project, env, "write a note", "--agent", "hello")
+    followup = _wait_for_followup(fake, proc)
+    drain(proc)
+    fake.stop()
+    shutil.rmtree(parent, ignore_errors=True)
+    shutil.rmtree(home, ignore_errors=True)
+    runner.check("rejection: follow-up chat/completions captured", followup is not None)
+    if followup:
+        tool_msgs, text = _tool_result_text(followup)
+        runner.check("rejection: tool-result message present", len(tool_msgs) > 0)
+        runner.check("rejection: tool-result carries an error about the invalid enum",
+                     any(m in text.lower() for m in ("urgent", "priority", "enum", "invalid")),
+                     f"tool_text: {text[:400]}")
 
-abs_project = Path(tempfile.mkdtemp(prefix="evolve-abstain-test-"))
-abs_dir = abs_project / "project"
-(abs_dir / "hooks").mkdir(parents=True)
-(abs_dir / "prompts").mkdir()
-(abs_dir / "prompts" / "preamble.md").write_text(ABSTAIN_PREAMBLE)
-(abs_dir / "prompts" / "chat.md").write_text(ABSTAIN_CHAT)
-abs_hook = abs_dir / "hooks" / "hello.py"
-abs_hook.write_text(
-    "#!/usr/bin/env python3\n"
-    "import json, sys\n"
-    "name = sys.argv[1] if len(sys.argv) > 1 else ''\n"
-    "try: ctx = json.loads(sys.stdin.read() or '{}')\n"
-    "except Exception: ctx = {}\n"
-    "if name == 'discover':\n"
-    "    print(json.dumps({'name': 'abstain'}), flush=True)\n"
-    # all other hooks (including mutate_request) intentionally produce nothing
-)
-abs_hook.chmod(0o755)
 
-abs_config = {
-    "$schema": "https://opencode.ai/config.json",
-    "provider": {"mock": {
-        "name": "Mock", "options": {"apiKey": "test", "baseURL": abs_base},
-        "models": {"fake-model": {"name": "Fake Model"}},
-    }},
-    "model": "mock/fake-model",
-    "small_model": "mock/fake-model",
-    "plugin": [plugin_path.as_uri()],
-}
-(abs_dir / "opencode.json").write_text(json.dumps(abs_config, indent=2))
+def scenario_abstain(runner, fixture):
+    """a hook returning {} must not let evolve impose a synthesized system
+    prompt; opencode's own system must survive."""
+    pre, chat = "EVOLVE_DEFAULT_PREAMBLE_SENTINEL_ZZZ", "EVOLVE_DEFAULT_CHAT_SENTINEL_QQQ"
+    fake = hc.start_fake_openai()
+    parent = Path(tempfile.mkdtemp(prefix="evolve-abstain-test-"))
+    project = parent / "project"
+    (project / "hooks").mkdir(parents=True)
+    (project / "prompts").mkdir()
+    (project / "prompts" / "preamble.md").write_text(pre)
+    (project / "prompts" / "chat.md").write_text(chat)
+    hook = project / "hooks" / "hello.py"
+    hook.write_text("#!/usr/bin/env python3\n"
+                    "import json, sys\n"
+                    "name = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+                    "try: ctx = json.loads(sys.stdin.read() or '{}')\n"
+                    "except Exception: ctx = {}\n"
+                    "if name == 'discover':\n"
+                    "    print(json.dumps({'name': 'abstain'}), flush=True)\n")
+    hook.chmod(0o755)
+    (project / "opencode.json").write_text(json.dumps(make_config(fake.base_url), indent=2))
+    home = make_home()
+    env = make_env(project, home, EVOLVE_HEARTBEAT_MS="999999")
+    proc = run_opencode(project, env, "hi")
+    hc.poll_for(lambda: hc.find_build_request(fake.captures()), proc, 60)
+    drain(proc)
+    main = hc.find_build_request(fake.captures())
+    fake.stop()
+    shutil.rmtree(parent, ignore_errors=True)
+    shutil.rmtree(home, ignore_errors=True)
+    runner.check("abstain: main chat/completions request captured", main is not None)
+    if main:
+        s = hc.system_text(main["body"])
+        runner.check("abstain: preamble.md sentinel not injected into main request",
+                     pre not in s, s[:400])
+        runner.check("abstain: chat.md sentinel not injected into main request",
+                     chat not in s, s[:400])
+        runner.check("abstain: opencode's own system prompt preserved", len(s) > 0)
 
-abs_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(abs_dir),
-           "EVOLVE_HEARTBEAT_MS": "999999"}
 
-abs_proc = subprocess.Popen(
-    [*OPENCODE_CMD, "run", "--print-logs", "--log-level", "INFO", "hi"],
-    cwd=str(abs_dir), env=abs_env,
-    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-)
+def scenario_permission(runner, fixture):
+    """a deny rule for a hook-defined tool blocks execution before side effects
+    and surfaces opencode's denial wording (not an InstanceRef defect)."""
+    denied = {"name": "blocked.md", "content": "should not be written"}
+    fake = hc.start_fake_openai("--consume-only-with-tools")
+    hc.program(fake.admin_url, [
+        {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                         "function": {"name": "hello_note_write", "arguments": json.dumps(denied)}}],
+         "finish_reason": "tool_calls"},
+        {"content": "done", "finish_reason": "stop"}])
+    parent, project = seed_project(fixture, fake.base_url,
+                                   permission={"hello_note_write": {"*": "allow", "blocked.md": "deny"}})
+    home = make_home()
+    env = make_env(project, home, EVOLVE_HEARTBEAT_MS="999999")
+    proc = run_opencode(project, env, "write a note to blocked.md", "--agent", "hello")
+    followup = _wait_for_followup(fake, proc)
+    drain(proc)
+    fake.stop()
+    blocked_existed = (project / "traits" / "blocked.md").exists()
+    shutil.rmtree(parent, ignore_errors=True)
+    shutil.rmtree(home, ignore_errors=True)
+    runner.check("permission: denied tool did not create file", not blocked_existed)
+    runner.check("permission: follow-up chat/completions captured", followup is not None)
+    if followup:
+        tool_msgs, text = _tool_result_text(followup)
+        runner.check("permission: tool-result message present", len(tool_msgs) > 0)
+        runner.check("permission: tool-result does not report a successful write",
+                     "wrote blocked.md" not in text, f"tool_text: {text[:400]}")
+        runner.check("permission: tool-result carries opencode's denial wording",
+                     "rule which prevents" in text.lower(), f"tool_text: {text[:400]}")
+        runner.check("permission: tool-result does not leak InstanceRef defect",
+                     "instanceref" not in text.lower(), f"tool_text: {text[:400]}")
 
-abs_deadline = time.time() + 60
-while time.time() < abs_deadline:
-    if any("chat/completions" in c["path"] and c["body"].get("tools")
-           for c in fetch_captures(abs_admin)):
-        break
-    if abs_proc.poll() is not None:
-        break
-    time.sleep(0.2)
 
-if abs_proc.poll() is None:
-    abs_proc.terminate()
-try:
-    abs_stdout, abs_stderr = abs_proc.communicate(timeout=15)
-except subprocess.TimeoutExpired:
-    abs_proc.kill()
-    abs_stdout, abs_stderr = abs_proc.communicate()
-abs_captured = fetch_captures(abs_admin)
-abs_fake.terminate()
+def scenario_compaction(runner, fixture):
+    """the compaction request's system + history prefix is byte-identical to the
+    preceding chat request (KV-cache stability); only the final user turn differs.
+    driven over `opencode serve`'s http api."""
+    sentinel = "EVOLVE_COMPACTION_SENTINEL_ABCDEFG"
+    fake = hc.start_fake_openai()
+    parent, project = seed_project(fixture, fake.base_url)
+    (project / "prompts" / "compaction.md").write_text(sentinel + "\n")
+    home = make_home()
+    env = make_env(project, home, EVOLVE_HEARTBEAT_MS="999999")
+    port = free_port()
+    print(f"starting opencode serve on port {port}...")
+    proc = subprocess.Popen(
+        [*OPENCODE_CMD, "serve", "--port", str(port), "--hostname", "127.0.0.1"],
+        cwd=str(project), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    url = f"http://127.0.0.1:{port}"
 
-(ARTIFACTS / "opencode_abstain.stdout.log").write_text(abs_stdout or "")
-(ARTIFACTS / "opencode_abstain.stderr.log").write_text(abs_stderr or "")
-(ARTIFACTS / "opencode_abstain.captured.json").write_text(
-    json.dumps(abs_captured, indent=2, default=str))
+    def http(method, path, body=None, timeout=60):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            txt = resp.read().decode("utf-8", "replace")
+        return json.loads(txt) if txt else None
 
-abs_main = next((c for c in abs_captured
-                 if "chat/completions" in c["path"] and c["body"].get("tools")), None)
-check("abstain: main chat/completions request captured", abs_main is not None,
-      f"paths: {[c['path'] for c in abs_captured]}")
+    # the http app binds the port ~1.5s before it can serve requests, so a
+    # tcp-connect check is a false-ready. poll a real GET until the app answers.
+    def serve_ready():
+        try:
+            with urllib.request.urlopen(url + "/config", timeout=2) as r:
+                return r.status == 200
+        except OSError:
+            return False
+    ready = hc.poll_for(serve_ready, proc, 60) or False
 
-if abs_main:
-    sys_text = "\n".join(
-        (m.get("content") if isinstance(m.get("content"), str)
-         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
-        for m in abs_main["body"].get("messages", []) if m.get("role") == "system")
-    check("abstain: preamble.md sentinel not injected into main request",
-          ABSTAIN_PREAMBLE not in sys_text,
-          f"evolve leaked preamble default despite hook abstain; system: {sys_text[:400]}")
-    check("abstain: chat.md sentinel not injected into main request",
-          ABSTAIN_CHAT not in sys_text,
-          f"evolve leaked chat default despite hook abstain; system: {sys_text[:400]}")
-    # sanity: opencode's own system should still be there (not wiped)
-    check("abstain: opencode's own system prompt preserved",
-          len(sys_text) > 0,
-          "system was empty — evolve wiped opencode's system on abstain")
+    runner.check("compaction: opencode serve is ready", bool(ready))
+    session_id = chat_ok = summarize_ok = None
+    err = None
+    if ready:
+        try:
+            session_id = (http("POST", "/session", {}) or {}).get("id")
+        except Exception as e:
+            err = f"session create: {e}"
+        runner.check("compaction: session created", bool(session_id), f"err: {err}")
+    if session_id:
+        try:
+            http("POST", f"/session/{session_id}/message",
+                 {"agent": "hello", "parts": [{"type": "text", "text": "hello world"}]})
+            chat_ok = True
+        except Exception as e:
+            err = f"session prompt: {e}"
+        runner.check("compaction: chat prompt succeeded", bool(chat_ok), f"err: {err}")
+    if chat_ok:
+        try:
+            http("POST", f"/session/{session_id}/summarize",
+                 {"providerID": "mock", "modelID": "fake-model"})
+            summarize_ok = True
+        except Exception as e:
+            err = f"session summarize: {e}"
+        runner.check("compaction: summarize call succeeded", bool(summarize_ok), f"err: {err}")
+    sout, serr = drain(proc)
+    caps = fake.chat_captures()
+    fake.stop()
+    # serve logs are the only way to diagnose a serve that never became ready.
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    (ARTIFACTS / "opencode_compaction.stdout.log").write_text(sout or "")
+    (ARTIFACTS / "opencode_compaction.stderr.log").write_text(serr or "")
+    (ARTIFACTS / "opencode_compaction.captured.json").write_text(
+        json.dumps(caps, indent=2, default=str))
+    shutil.rmtree(parent, ignore_errors=True)
+    shutil.rmtree(home, ignore_errors=True)
 
-shutil.rmtree(abs_project, ignore_errors=True)
+    def has_sentinel(body):
+        return any(sentinel in hc._content_text(m.get("content")) for m in body.get("messages", []))
 
-# --- permission enforcement ---
-# regression test: opencode-evolve's plugin-defined tools call context.ask()
-# before execution to gate on the user's permission config. context.ask()
-# returns an Effect (lazy), so plain `await context.ask(...)` is a no-op and
-# the permission system is bypassed entirely. assert that a deny rule for a
-# hook-defined tool actually prevents execution and surfaces as an error in
-# the follow-up tool-result.
+    chat_cap = compact_cap = None
+    for c in caps:
+        if has_sentinel(c["body"]):
+            compact_cap = compact_cap or c
+        elif c["body"].get("tools"):
+            chat_cap = c
+    runner.check("compaction: chat request captured", chat_cap is not None)
+    runner.check("compaction: compaction request captured (found sentinel)", compact_cap is not None)
+    if chat_cap and compact_cap:
+        chat_msgs = chat_cap["body"].get("messages", [])
+        cmp_msgs = compact_cap["body"].get("messages", [])
+        chat_sys = [m for m in chat_msgs if m.get("role") == "system"]
+        runner.check("compaction: chat system is hello's composed prompt (gate fired)",
+                     fixture.preamble in "\n".join(hc._content_text(m.get("content")) for m in chat_sys))
+        runner.check("compaction: system messages byte-identical to chat (KV cache stable)",
+                     chat_sys == [m for m in cmp_msgs if m.get("role") == "system"])
+        runner.check("compaction: history prefix byte-identical to chat (KV cache stable)",
+                     len(cmp_msgs) >= len(chat_msgs) + 1 and cmp_msgs[:len(chat_msgs)] == chat_msgs,
+                     f"chat={len(chat_msgs)}, compaction={len(cmp_msgs)}")
+        last = cmp_msgs[-1] if cmp_msgs else {}
+        runner.check("compaction: last message is user turn carrying the compaction prompt",
+                     last.get("role") == "user" and sentinel in hc._content_text(last.get("content")))
+        runner.check("compaction: sentinel absent from chat request",
+                     not has_sentinel(chat_cap["body"]))
+        runner.check("compaction: sentinel absent from compaction prefix (only in final user turn)",
+                     not has_sentinel({"messages": cmp_msgs[:-1]}))
 
-# fake-openai with consume-only-with-tools; program a note_write tool_call
-# targeting the denied path, then a plain "done". opencode's deny rule must
-# block execution before the file is written.
-DENIED_ARGS = {"name": "blocked.md", "content": "should not be written"}
-perm_fake, perm_base, perm_admin = start_fake_openai("--consume-only-with-tools")
-program_responses(perm_admin, [
-    {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
-                     "function": {"name": "hello_note_write",
-                                  "arguments": json.dumps(DENIED_ARGS)}}],
-     "finish_reason": "tool_calls"},
-    {"content": "done", "finish_reason": "stop"},
-])
 
-perm_project = Path(tempfile.mkdtemp(prefix="evolve-perm-test-"))
-shutil.copytree(hello_src, perm_project / "project", dirs_exist_ok=False)
-perm_dir = perm_project / "project"
-(perm_dir / "hooks" / "hello.py").chmod(0o755)
+def main():
+    adapter = OpencodeAdapter()
+    if not hc.preflight(adapter):
+        return 0
+    fixture = hc.Fixture()
+    runner = hc.CheckRunner()
+    if not adapter.build(runner):
+        runner.summary()
+        return 1
+    result = hc.run_conformance(adapter, runner, fixture)
+    hc.dump_artifacts(ARTIFACTS, "opencode_integration", result)
+    scenario_rejection(runner, fixture)
+    scenario_abstain(runner, fixture)
+    scenario_permission(runner, fixture)
+    scenario_compaction(runner, fixture)
+    runner.summary()
+    return runner.exit_code()
 
-# deny hello_note_write for the specific target; anything else allowed.
-perm_config = {
-    "$schema": "https://opencode.ai/config.json",
-    "provider": {"mock": {
-        "name": "Mock", "options": {"apiKey": "test", "baseURL": perm_base},
-        "models": {"fake-model": {"name": "Fake Model"}},
-    }},
-    "model": "mock/fake-model",
-    "small_model": "mock/fake-model",
-    "plugin": [plugin_path.as_uri()],
-    "permission": {
-        "hello_note_write": {
-            "*": "allow",
-            "blocked.md": "deny",
-        },
-    },
-}
-(perm_dir / "opencode.json").write_text(json.dumps(perm_config, indent=2))
 
-perm_env = {**env, "OPENCODE_EVOLVE_WORKSPACE": str(perm_dir),
-            "EVOLVE_HEARTBEAT_MS": "999999"}
-
-perm_proc = subprocess.Popen(
-    [*OPENCODE_CMD, "run", "--agent", "hello", "--print-logs", "--log-level", "INFO", "write a note to blocked.md"],
-    cwd=str(perm_dir), env=perm_env,
-    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-)
-
-# wait for the follow-up tools-bearing request (carrying the tool-result)
-perm_deadline = time.time() + 60
-perm_followup = None
-while time.time() < perm_deadline:
-    tools_reqs = [c for c in fetch_captures(perm_admin)
-                  if "chat/completions" in c["path"] and c["body"].get("tools")
-                  and not is_heartbeat_request(c["body"])]
-    if len(tools_reqs) >= 2:
-        perm_followup = tools_reqs[1]
-        break
-    if perm_proc.poll() is not None:
-        break
-    time.sleep(0.2)
-
-if perm_proc.poll() is None:
-    perm_proc.terminate()
-try:
-    perm_stdout, perm_stderr = perm_proc.communicate(timeout=15)
-except subprocess.TimeoutExpired:
-    perm_proc.kill()
-    perm_stdout, perm_stderr = perm_proc.communicate()
-perm_captured = fetch_captures(perm_admin)
-perm_fake.terminate()
-
-(ARTIFACTS / "opencode_permission.stdout.log").write_text(perm_stdout or "")
-(ARTIFACTS / "opencode_permission.stderr.log").write_text(perm_stderr or "")
-(ARTIFACTS / "opencode_permission.captured.json").write_text(
-    json.dumps(perm_captured, indent=2, default=str))
-
-# the denied file must NOT have been written — the permission check must
-# fire BEFORE the tool's side effects run.
-blocked_path = perm_dir / "traits" / "blocked.md"
-check("permission: denied tool did not create file",
-      not blocked_path.exists(),
-      f"blocked.md exists at {blocked_path} despite deny rule — "
-      f"permission check was bypassed")
-
-check("permission: follow-up chat/completions captured", perm_followup is not None,
-      f"captured: {len(perm_captured)} reqs")
-
-if perm_followup:
-    msgs = perm_followup["body"].get("messages", [])
-    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
-    tool_text = " ".join(
-        (m.get("content") if isinstance(m.get("content"), str)
-         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
-        for m in tool_msgs
-    )
-    check("permission: tool-result message present",
-          len(tool_msgs) > 0, f"roles: {[m.get('role') for m in msgs]}")
-    # successful write returns "wrote blocked.md"; denial must not.
-    check("permission: tool-result does not report a successful write",
-          "wrote blocked.md" not in tool_text,
-          f"tool executed despite deny rule; tool_text: {tool_text[:400]}")
-    # denial must surface opencode's DeniedError wording — not a generic
-    # exception string. opencode's permission system uses the message
-    # "rule which prevents you from using this specific tool call".
-    check("permission: tool-result carries opencode's denial wording",
-          "rule which prevents" in tool_text.lower(),
-          f"tool_text: {tool_text[:400]}")
-    # regression guard: if askPermission isn't properly bound to opencode's
-    # Effect context (InstanceRef missing), the denial path collapses into a
-    # plain "tool error: InstanceRef not provided" — which we'd otherwise
-    # mistake for a legitimate denial. fail loudly instead.
-    check("permission: tool-result does not leak InstanceRef defect",
-          "instanceref" not in tool_text.lower(),
-          f"context.ask plumbing is broken; tool_text: {tool_text[:400]}")
-
-shutil.rmtree(perm_project, ignore_errors=True)
-
-# --- compaction: verify KV cache prefix is preserved ---
-# the compaction agent differs from the chat agent, so without the plugin's
-# sessionBasePrompt cache the system prompt would diverge and invalidate the
-# KV cache at token 0. assert that the compaction request's system messages
-# are byte-identical to the preceding chat request's, and the message history
-# is a true prefix — only the final user turn differs (the compaction prompt).
-
-COMPACT_SENTINEL = "EVOLVE_COMPACTION_SENTINEL_ABCDEFG"
-
-# fake-openai with the default fallback stream; opencode serve drives chat +
-# summarize against it, and we assert on the captured request prefixes.
-cmp_fake, cmp_base, cmp_admin = start_fake_openai()
-
-cmp_project = Path(tempfile.mkdtemp(prefix="evolve-compact-test-"))
-shutil.copytree(hello_src, cmp_project / "project", dirs_exist_ok=False)
-cmp_dir = cmp_project / "project"
-(cmp_dir / "hooks" / "hello.py").chmod(0o755)
-# distinctive sentinel in the compaction prompt — pinpoints exactly where it
-# ends up in the outgoing request
-(cmp_dir / "prompts" / "compaction.md").write_text(COMPACT_SENTINEL + "\n")
-
-cmp_config = {
-    "$schema": "https://opencode.ai/config.json",
-    "provider": {"mock": {
-        "name": "Mock", "options": {"apiKey": "test", "baseURL": cmp_base},
-        "models": {"fake-model": {"name": "Fake Model"}},
-    }},
-    "model": "mock/fake-model",
-    "small_model": "mock/fake-model",
-    "plugin": [plugin_path.as_uri()],
-}
-(cmp_dir / "opencode.json").write_text(json.dumps(cmp_config, indent=2))
-
-# fresh fake_home so opencode server state is isolated from earlier blocks
-cmp_home = Path(tempfile.mkdtemp(prefix="evolve-compact-home-"))
-for sub in (".config/opencode", ".local/share/opencode",
-            ".cache/opencode", ".local/state/opencode"):
-    (cmp_home / sub).mkdir(parents=True, exist_ok=True)
-
-cmp_env = {
-    **base_env,
-    "HOME": str(cmp_home),
-    "XDG_CONFIG_HOME": str(cmp_home / ".config"),
-    "XDG_DATA_HOME": str(cmp_home / ".local/share"),
-    "XDG_CACHE_HOME": str(cmp_home / ".cache"),
-    "XDG_STATE_HOME": str(cmp_home / ".local/state"),
-    "OPENCODE_EVOLVE_WORKSPACE": str(cmp_dir),
-    "EVOLVE_HEARTBEAT_MS": "999999",  # no heartbeat noise
-    "OPENAI_API_KEY": "test",
-    "CI": "1",
-}
-
-serve_port = free_port()
-print(f"starting opencode serve on port {serve_port}...")
-cmp_proc = subprocess.Popen(
-    [*OPENCODE_CMD, "serve", "--port", str(serve_port), "--hostname", "127.0.0.1"],
-    cwd=str(cmp_dir), env=cmp_env,
-    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-)
-
-# poll the port until opencode accepts connections (or process dies)
-serve_url = f"http://127.0.0.1:{serve_port}"
-ready = False
-ready_deadline = time.time() + 30
-while time.time() < ready_deadline:
-    if cmp_proc.poll() is not None:
-        break
-    try:
-        with socket.create_connection(("127.0.0.1", serve_port), timeout=0.5):
-            ready = True
-            break
-    except OSError:
-        time.sleep(0.2)
-
-check("compaction: opencode serve is listening", ready,
-      "process exited early; see opencode_compaction.*.log")
-
-def _http_json(method, path, body=None, timeout=60):
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(serve_url + path, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        txt = resp.read().decode("utf-8", "replace")
-    return json.loads(txt) if txt else None
-
-session_id = None
-chat_ok = summarize_ok = False
-cmp_err = None
-
-if ready:
-    try:
-        session = _http_json("POST", "/session", {})
-        session_id = session.get("id")
-    except Exception as e:
-        cmp_err = f"session create: {e}"
-    check("compaction: session created", bool(session_id), f"err: {cmp_err}")
-
-if session_id:
-    try:
-        _http_json("POST", f"/session/{session_id}/message",
-                   {"agent": "hello",
-                    "parts": [{"type": "text", "text": "hello world"}]})
-        chat_ok = True
-    except Exception as e:
-        cmp_err = f"session prompt: {e}"
-    check("compaction: chat prompt succeeded", chat_ok, f"err: {cmp_err}")
-
-if chat_ok:
-    try:
-        _http_json("POST", f"/session/{session_id}/summarize",
-                   {"providerID": "mock", "modelID": "fake-model"})
-        summarize_ok = True
-    except Exception as e:
-        cmp_err = f"session summarize: {e}"
-    check("compaction: summarize call succeeded", summarize_ok, f"err: {cmp_err}")
-
-# shut down the server
-if cmp_proc.poll() is None:
-    cmp_proc.terminate()
-try:
-    cmp_stdout, cmp_stderr = cmp_proc.communicate(timeout=15)
-except subprocess.TimeoutExpired:
-    cmp_proc.kill()
-    cmp_stdout, cmp_stderr = cmp_proc.communicate()
-cmp_captured = fetch_captures(cmp_admin)
-cmp_fake.terminate()
-
-(ARTIFACTS / "opencode_compaction.stdout.log").write_text(cmp_stdout or "")
-(ARTIFACTS / "opencode_compaction.stderr.log").write_text(cmp_stderr or "")
-(ARTIFACTS / "opencode_compaction.captured.json").write_text(
-    json.dumps(cmp_captured, indent=2, default=str))
-
-# find the chat and compaction LLM calls in the captured requests.
-# compaction discriminator: the sentinel appears in one of the messages.
-# chat discriminator: tools-bearing (main build-agent call), no sentinel.
-# (opencode also fires a title-generation call which has no tools and no sentinel.)
-def _has_sentinel(body):
-    for m in body.get("messages", []) or []:
-        c = m.get("content")
-        if isinstance(c, str) and COMPACT_SENTINEL in c:
-            return True
-        if isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict) and COMPACT_SENTINEL in (p.get("text") or ""):
-                    return True
-    return False
-
-chat_cap = compact_cap = None
-for c in cmp_captured:
-    if "chat/completions" not in c["path"]:
-        continue
-    body = c["body"]
-    if _has_sentinel(body):
-        compact_cap = compact_cap or c
-    elif body.get("tools"):
-        chat_cap = c  # latest tools-bearing non-compaction wins
-
-check("compaction: chat request captured", chat_cap is not None,
-      f"captured paths: {[x['path'] for x in cmp_captured]}")
-check("compaction: compaction request captured (found sentinel)", compact_cap is not None,
-      f"captured paths: {[x['path'] for x in cmp_captured]}")
-
-if chat_cap and compact_cap:
-    (ARTIFACTS / "opencode_compaction.chat_request.json").write_text(
-        json.dumps(chat_cap, indent=2, default=str))
-    (ARTIFACTS / "opencode_compaction.compaction_request.json").write_text(
-        json.dumps(compact_cap, indent=2, default=str))
-
-    chat_msgs = chat_cap["body"].get("messages", [])
-    cmp_msgs = compact_cap["body"].get("messages", [])
-
-    chat_sys = [m for m in chat_msgs if m.get("role") == "system"]
-    cmp_sys = [m for m in cmp_msgs if m.get("role") == "system"]
-    chat_sys_text = "\n".join(
-        (m["content"] if isinstance(m.get("content"), str)
-         else "".join(p.get("text","") for p in (m.get("content") or []) if isinstance(p, dict)))
-        for m in chat_sys)
-    # proves the marker-gated mutate_request ran on the chat turn — without
-    # the gate firing, opencode's built-in agent prompt would be in system[0]
-    # instead of hello's composed preamble.
-    check("compaction: chat system is hello's composed prompt (gate fired)",
-          expected_preamble in chat_sys_text,
-          f"hello preamble missing from chat system; got: {chat_sys_text[:300]}")
-    check("compaction: system messages byte-identical to chat (KV cache stable)",
-          chat_sys == cmp_sys,
-          f"chat sys len={sum(len(str(m.get('content'))) for m in chat_sys)}; "
-          f"compaction sys len={sum(len(str(m.get('content'))) for m in cmp_sys)}")
-
-    # compaction = chat history + one new user turn carrying the compaction
-    # prompt. the prefix up to the new turn must be byte-identical.
-    check("compaction: history prefix byte-identical to chat (KV cache stable)",
-          len(cmp_msgs) >= len(chat_msgs) + 1 and cmp_msgs[:len(chat_msgs)] == chat_msgs,
-          f"chat msgs={len(chat_msgs)}, compaction msgs={len(cmp_msgs)}")
-
-    last = cmp_msgs[-1] if cmp_msgs else {}
-    last_text = (last.get("content") if isinstance(last.get("content"), str)
-                 else "".join(p.get("text","") for p in (last.get("content") or []) if isinstance(p, dict)))
-    check("compaction: last message is user turn carrying the compaction prompt",
-          last.get("role") == "user" and COMPACT_SENTINEL in last_text,
-          f"last role={last.get('role')}, text[:120]={last_text[:120]}")
-
-    check("compaction: sentinel absent from chat request",
-          not _has_sentinel(chat_cap["body"]),
-          "compaction prompt leaked into chat request — check mutate_request plumbing")
-    check("compaction: sentinel absent from compaction prefix (only in final user turn)",
-          not _has_sentinel({"messages": cmp_msgs[:-1]}),
-          "compaction prompt appears outside the final user turn")
-
-shutil.rmtree(cmp_project, ignore_errors=True)
-shutil.rmtree(cmp_home, ignore_errors=True)
-
-# --- cleanup ---
-
-shutil.rmtree(workdir, ignore_errors=True)
-shutil.rmtree(fake_home, ignore_errors=True)
-
-# --- hard-fail: every plugin tool parameter must carry a description ---
-# zod `.describe()` → JSON schema `description` must survive all the way into
-# the outgoing request, otherwise the LLM sees nameless/untyped knobs.
-# scoped to evolve/hello plugin tools; opencode's built-in tools (webfetch,
-# etc.) are out of scope and may have their own gaps upstream.
-missing_param_desc = []
-for t in tools:
-    tname = t["function"]["name"]
-    if not (tname.startswith("evolve_") or tname.startswith("hello_")):
-        continue
-    props = (t["function"].get("parameters", {}).get("properties") or {})
-    for pname, pspec in props.items():
-        if not (isinstance(pspec, dict) and pspec.get("description")):
-            missing_param_desc.append(f"{tname}.{pname}")
-check("every plugin tool parameter has a description",
-      not missing_param_desc,
-      f"missing descriptions on {len(missing_param_desc)} params: {missing_param_desc[:10]}"
-      + (f" ... (+{len(missing_param_desc)-10} more)" if len(missing_param_desc) > 10 else ""))
-
-print(f"\n{PASS} passed, {FAIL} failed")
-sys.exit(1 if FAIL else 0)
+if __name__ == "__main__":
+    sys.exit(main())
